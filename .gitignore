@@ -1,0 +1,70 @@
+# -----------------------------------------------------------------------------
+# TALOS / AWS scaffold / Python / local runtime
+# -----------------------------------------------------------------------------
+
+# Project data
+data/
+
+# Python cache / virtual env / test cache
+**/__pycache__/
+**/venv/
+**/.venv/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+*.py[cod]
+
+# Environment files
+.env
+.env.*
+*.env
+*.env.*
+!.env.example
+
+# AWS scaffold real env files
+deploy/docker/aws/product/.env
+deploy/docker/aws/aor/.env
+worker/local/.env
+
+# Output / generated artifacts
+**/*_output/
+*_output
+*_output.*
+*_cookies
+*_cookies.*
+raw_artifacts/
+artifacts/
+uploads/
+logs/
+*.log
+*.out
+*.err
+
+# Local worker scratch / cache
+worker/local/.cache/
+worker/local/work/
+worker/local/models/
+worker/local/output/
+worker/local/tmp/
+
+# Credentials / tokens
+gmail_token.json
+client_secret.json
+credentials.json
+
+# Archives / backups
+*.zip
+*.tar
+*.tar.gz
+*.7z
+*.bak
+*.dump
+
+# OS / editor junk
+**/.SynologyWorkingDirectory/
+desktop.ini
+*desktop.ini
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
