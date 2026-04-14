@@ -1,0 +1,90 @@
+{
+  "$schema_version": "1.0.0",
+  "source_of_truth_doc": "docs/aor_translator_boundary.md",
+  "systems": {
+    "translator": {
+      "id": "universal_translator",
+      "display_name": "Universal Translator for the Neurodivergent",
+      "role": "commercializable_user_facing_product",
+      "databases": ["talos_product"],
+      "compose_project": "talos-product",
+      "user_visibility": "public"
+    },
+    "aor": {
+      "id": "aor",
+      "display_name": "Architecture of Responsibility",
+      "role": "internal_governance_and_orchestration",
+      "databases": ["talos_aor"],
+      "compose_project": "talos-aor",
+      "user_visibility": "internal_only"
+    }
+  },
+  "data_boundaries": {
+    "cross_database_foreign_keys_allowed": false,
+    "cross_reference_style": "opaque_uuid",
+    "shared_host_allowed": true,
+    "shared_compose_project_allowed": false,
+    "shared_database_allowed": false
+  },
+  "allowed_events_product_to_aor": [
+    "PROCESSING_FAILURE","BASELINE_MISSING","BASELINE_BACKFILL_QUEUED",
+    "CONTACT_MATCH_AMBIGUOUS","ADVISORY_HIGH_UNCERTAINTY","ADVISORY_HIGH_RISK",
+    "WORKER_OFFLINE","LIVE_TO_DEFERRED_FALLBACK","DEPLOY_FAILURE",
+    "SYSTEM_HEALTH_WARNING"
+  ],
+  "allowed_events_aor_to_product": [
+    "POLICY_UPDATE","THRESHOLD_UPDATE","DETAIL_LEVEL_UPDATE",
+    "APPROVED_RESPONSE_TEMPLATE","ESCALATION_DECISION",
+    "CONTACT_REVIEW_DECISION","FEATURE_FLAG_UPDATE"
+  ],
+  "forbidden_flows": [
+    {"id":"no_raw_deliberation_to_product","description":"AoR internal deliberation logs must not reach the product."},
+    {"id":"no_chain_of_thought","description":"Raw chain-of-thought logging is forbidden in either direction."},
+    {"id":"no_consultant_notes_to_product","description":"Unrestricted consultant notes must not cross into the product."},
+    {"id":"no_family_chat_to_product","description":"Unrelated private/family Matrix content must not reach the product."},
+    {"id":"no_matrix_log_mirror_to_product","description":"Matrix rooms must not be mirrored wholesale into product tables."},
+    {"id":"no_raw_artifacts_to_matrix","description":"Raw audio, email bodies, and transcripts must not be posted into Matrix rooms."},
+    {"id":"no_user_messages_as_aor_input","description":"Product user messages must not be routed to AoR as AoR input."},
+    {"id":"bridge_cannot_mutate_product_state","description":"matrix_bridge may only update bridge_outbox (delivered_at / delivery_error)."}
+  ],
+  "baseline_states": {
+    "NONE":      {"use_model":"default_model","queue_backfill":true,"provisional":true},
+    "QUEUED":    {"use_model":"default_model","queue_backfill":false,"provisional":true},
+    "PROCESSING":{"use_model":"default_model","queue_backfill":false,"provisional":true},
+    "PARTIAL":   {"use_model":"partial_baseline","queue_backfill":false,"provisional":true},
+    "READY":     {"use_model":"contact_baseline","queue_backfill":false,"provisional":false},
+    "STALE":     {"use_model":"contact_baseline","queue_refresh":true,"provisional":false}
+  },
+  "escalation_conditions": [
+    {"condition":"advisory.confidence < policy.min_confidence","emit":"ADVISORY_HIGH_UNCERTAINTY"},
+    {"condition":"advisory.risk_level == 'high'","emit":"ADVISORY_HIGH_RISK"},
+    {"condition":"contact_candidate.sightings_count >= policy.promotion_threshold AND status == 'open'","emit":"CONTACT_MATCH_AMBIGUOUS"},
+    {"condition":"processing_job.state == 'FAILED'","emit":"PROCESSING_FAILURE"},
+    {"condition":"local_worker.healthy == false","emit":"WORKER_OFFLINE"},
+    {"condition":"scheduler dispatched to worker while worker.online == false","emit":"LIVE_TO_DEFERRED_FALLBACK"},
+    {"condition":"deploy_hook run finished with status == 'failed'","emit":"DEPLOY_FAILURE"},
+    {"condition":"any service health probe returns non-2xx for N consecutive intervals","emit":"SYSTEM_HEALTH_WARNING"},
+    {"condition":"contact_baseline.state == 'NONE' and event arrives","emit":"BASELINE_MISSING"},
+    {"condition":"scheduler enqueues CONTACT_HISTORY_BACKFILL","emit":"BASELINE_BACKFILL_QUEUED"}
+  ],
+  "default_visibility_rules": {
+    "front_desk_room_alias": "#aor-front-desk:taloscognitive.com",
+    "deliberation_room_alias": "#aor-deliberation:taloscognitive.com",
+    "alerts_room_alias": "#system-alerts:taloscognitive.com",
+    "verbose_room_alias": "#system-verbose:taloscognitive.com",
+    "infrastructure_room_alias": "#infrastructure:taloscognitive.com",
+    "detail_levels": ["quiet","normal","verbose"],
+    "default_detail_level": "normal",
+    "user_facing_detail_level": "quiet"
+  },
+  "phase1_constraints": {
+    "aor_to_product_consumer_implemented": false,
+    "bridge_user_provisioning": "manual",
+    "matrix_bridge_is_thin_relay_only": true,
+    "matrix_bridge_does_not_do_reasoning": true,
+    "local_worker_is_single_combined_service": true,
+    "kubernetes_used": false,
+    "argocd_used": false,
+    "bridge_outbox_has_retry_attempt_tracking": false
+  }
+}

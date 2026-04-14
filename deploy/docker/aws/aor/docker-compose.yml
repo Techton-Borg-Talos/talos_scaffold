@@ -1,0 +1,61 @@
+# TALOS AoR / Internal Stack (single-Caddy model)
+#
+# Bring up BEFORE the product stack's caddy. Product Caddy attaches to
+# talos-aor_aor_net as an external network.
+#
+# The Postgres container here holds two databases in one instance:
+#   - synapse    : Matrix homeserver DB
+#   - talos_aor  : AoR governance DB (policies, escalations, bridge audit)
+# Both separate from talos_product.
+#
+# No Caddy in this stack; product Caddy reverse-proxies matrix.* and chat.*
+# via aor_net.
+
+name: talos-aor
+
+networks:
+  aor_net:
+    driver: bridge
+
+volumes:
+  postgres_aor_data:
+  synapse_data:
+
+services:
+  postgres_aor:
+    image: postgres:16-alpine
+    container_name: talos_postgres_aor
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${SYNAPSE_DB_NAME:-synapse}
+      POSTGRES_USER: ${SYNAPSE_DB_USER:-synapse}
+      POSTGRES_PASSWORD: ${SYNAPSE_DB_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      - postgres_aor_data:/var/lib/postgresql/data
+      - ../../../../infra/sql/000_aor_databases.sql:/docker-entrypoint-initdb.d/000_aor_databases.sql:ro
+      - ../../../../infra/sql/002_init_aor.sql:/docker-entrypoint-initdb.d/002_init_aor.sql:ro
+    networks: [aor_net]
+    ports:
+      - "127.0.0.1:5433:5432"
+
+  synapse:
+    image: matrixdotorg/synapse:latest
+    container_name: talos_synapse
+    restart: unless-stopped
+    environment:
+      SYNAPSE_SERVER_NAME: ${SYNAPSE_SERVER_NAME:-taloscognitive.com}
+      SYNAPSE_REPORT_STATS: "no"
+    volumes:
+      - synapse_data:/data
+    depends_on:
+      - postgres_aor
+    networks: [aor_net]
+
+  element:
+    image: vectorim/element-web:latest
+    container_name: talos_element
+    restart: unless-stopped
+    volumes:
+      - ./element-config.json:/app/config.json:ro
+    networks: [aor_net]

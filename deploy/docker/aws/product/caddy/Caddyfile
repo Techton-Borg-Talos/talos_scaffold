@@ -1,0 +1,45 @@
+# TALOS :: Single-Caddy model (Phase 1)
+#
+# One Caddy runs on the host's :80/:443 and fronts BOTH stacks by attaching
+# to product_net AND aor_net.
+#
+# Public vhosts:
+#   intake.taloscognitive.com  -> product intake API + deploy hook
+#   matrix.taloscognitive.com  -> AoR Synapse
+#   chat.taloscognitive.com    -> AoR Element Web
+
+{
+    email admin@taloscognitive.com
+}
+
+intake.taloscognitive.com {
+    encode gzip
+    handle_path /_deploy/* {
+        reverse_proxy deploy_hook:8090
+    }
+    handle {
+        reverse_proxy intake_api:8080
+    }
+    log {
+        output stdout
+        format console
+    }
+}
+
+matrix.taloscognitive.com {
+    encode gzip
+    reverse_proxy synapse:8008
+    log {
+        output stdout
+        format console
+    }
+}
+
+chat.taloscognitive.com {
+    encode gzip
+    reverse_proxy element:80
+    log {
+        output stdout
+        format console
+    }
+}

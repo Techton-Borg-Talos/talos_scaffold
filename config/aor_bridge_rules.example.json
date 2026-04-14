@@ -1,0 +1,62 @@
+{
+  "$schema_version": "1.0.0",
+  "default_template": "[{event_code}] {payload_json}",
+  "templates": {
+    "generic_alert": "\u26a0 [{event_code}] {payload_json}",
+    "generic_verbose": "\u2022 {event_code} :: {payload_json}",
+    "quiet_user_facing": "A high-risk signal was flagged. See #aor-deliberation for context."
+  },
+  "event_templates": {
+    "BASELINE_MISSING":          "\u00b7 baseline missing for contact {p.contact_uuid}; default model engaged",
+    "BASELINE_BACKFILL_QUEUED":  "\u00b7 backfill queued for contact {p.contact_uuid} (key={p.idempotency_key})",
+    "CONTACT_MATCH_AMBIGUOUS":   "\ud83d\uddc2 Candidate {p.candidate_uuid} ({p.identity_kind}={p.identity_value}) hit threshold with {p.sightings_count} sightings.",
+    "ADVISORY_HIGH_UNCERTAINTY": "\ud83d\uddc2 Advisory {p.advisory_uuid} low-confidence ({p.confidence}) via {p.provenance}.",
+    "ADVISORY_HIGH_RISK":        "\u26a0 High-risk advisory {p.advisory_uuid}: {p.summary}",
+    "WORKER_OFFLINE":            "\u26a0 Local worker unreachable at {p.local_worker_url} ({p.error})",
+    "LIVE_TO_DEFERRED_FALLBACK": "\u00b7 live\u2192deferred: job {p.job_uuid} ({p.job_type})",
+    "DEPLOY_FAILURE":            "\u26a0 Deploy failed at step '{p.failed_step}'.",
+    "PROCESSING_FAILURE":        "\u26a0 Processing failed: job {p.job_uuid} ({p.job_type}) \u2014 {p.error}",
+    "SYSTEM_HEALTH_WARNING":     "\u26a0 {p.service}: {p.severity} \u2014 {p.detail}"
+  },
+  "default_route": {
+    "room_alias": "#system-verbose:taloscognitive.com",
+    "detail_level": "verbose",
+    "template_key": "generic_verbose"
+  },
+  "routes": {
+    "PROCESSING_FAILURE": [
+      {"room_alias":"#system-alerts:taloscognitive.com","detail_level":"normal"},
+      {"room_alias":"#system-verbose:taloscognitive.com","detail_level":"verbose"}
+    ],
+    "BASELINE_MISSING": [
+      {"room_alias":"#system-verbose:taloscognitive.com","detail_level":"verbose"}
+    ],
+    "BASELINE_BACKFILL_QUEUED": [
+      {"room_alias":"#system-verbose:taloscognitive.com","detail_level":"verbose"}
+    ],
+    "CONTACT_MATCH_AMBIGUOUS": [
+      {"room_alias":"#aor-deliberation:taloscognitive.com","detail_level":"normal"}
+    ],
+    "ADVISORY_HIGH_UNCERTAINTY": [
+      {"room_alias":"#aor-deliberation:taloscognitive.com","detail_level":"normal"}
+    ],
+    "ADVISORY_HIGH_RISK": [
+      {"room_alias":"#aor-front-desk:taloscognitive.com","detail_level":"quiet","template_key":"quiet_user_facing"},
+      {"room_alias":"#aor-deliberation:taloscognitive.com","detail_level":"normal"}
+    ],
+    "WORKER_OFFLINE": [
+      {"room_alias":"#system-alerts:taloscognitive.com","detail_level":"normal"},
+      {"room_alias":"#infrastructure:taloscognitive.com","detail_level":"verbose"}
+    ],
+    "LIVE_TO_DEFERRED_FALLBACK": [
+      {"room_alias":"#system-verbose:taloscognitive.com","detail_level":"verbose"}
+    ],
+    "DEPLOY_FAILURE": [
+      {"room_alias":"#system-alerts:taloscognitive.com","detail_level":"normal"},
+      {"room_alias":"#infrastructure:taloscognitive.com","detail_level":"verbose"}
+    ],
+    "SYSTEM_HEALTH_WARNING": [
+      {"room_alias":"#system-alerts:taloscognitive.com","detail_level":"normal"}
+    ]
+  }
+}

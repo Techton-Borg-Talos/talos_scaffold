@@ -1,0 +1,62 @@
+# Git
+.git
+.gitignore
+
+# Python cache / tests / virtual env
+**/__pycache__/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.venv/
+**/venv/
+*.py[cod]
+
+# Local env / secrets
+.env
+.env.*
+*.env
+*.env.*
+!.env.example
+
+# Data / artifacts / logs
+data/
+raw_artifacts/
+artifacts/
+uploads/
+logs/
+*.log
+*.out
+*.err
+**/*_output/
+*_output
+*_output.*
+*_cookies
+*_cookies.*
+
+# Worker local scratch / cache
+worker/local/.cache/
+worker/local/work/
+worker/local/models/
+worker/local/output/
+worker/local/tmp/
+
+# Credentials / tokens
+gmail_token.json
+client_secret.json
+credentials.json
+
+# Editor / OS junk
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+**/.SynologyWorkingDirectory/
+
+# Archives / backups
+*.zip
+*.tar
+*.tar.gz
+*.7z
+*.bak
+*.dump

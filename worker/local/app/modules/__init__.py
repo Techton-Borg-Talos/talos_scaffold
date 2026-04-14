@@ -1,0 +1,1 @@
+"""TALOS worker module registry."""

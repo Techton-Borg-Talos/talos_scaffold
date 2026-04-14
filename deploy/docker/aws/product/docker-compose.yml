@@ -1,0 +1,142 @@
+# TALOS Product Stack (Universal Translator)
+#
+# Compose project name: talos-product
+# This stack is the commercializable product side. The `caddy` service here
+# is the SINGLE host-wide Caddy that fronts all three public vhosts:
+#   intake.taloscognitive.com -> this stack (intake_api + deploy_hook)
+#   matrix.taloscognitive.com -> talos-aor synapse (via aor_net)
+#   chat.taloscognitive.com   -> talos-aor element (via aor_net)
+#
+# Only the single Caddy crosses the network boundary to reach AoR.
+# AoR and Product otherwise stay fully separate (different compose project,
+# different databases).
+
+name: talos-product
+
+networks:
+  product_net:
+    driver: bridge
+  aor_net:
+    external: true
+    name: talos-aor_aor_net
+
+volumes:
+  postgres_product_data:
+  caddy_product_data:
+  caddy_product_config:
+  raw_artifacts:
+
+services:
+  postgres_product:
+    image: postgres:16-alpine
+    container_name: talos_postgres_product
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${PRODUCT_DB_NAME:-talos_product}
+      POSTGRES_USER: ${PRODUCT_DB_USER:-talos_product}
+      POSTGRES_PASSWORD: ${PRODUCT_DB_PASSWORD}
+    volumes:
+      - postgres_product_data:/var/lib/postgresql/data
+      - ../../../../infra/sql/001_init_product.sql:/docker-entrypoint-initdb.d/001_init_product.sql:ro
+      - ../../../../infra/sql/003_contact_registry.sql:/docker-entrypoint-initdb.d/003_contact_registry.sql:ro
+    networks: [product_net]
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  intake_api:
+    build:
+      context: ../../../../services/intake_api
+    container_name: talos_intake_api
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${PRODUCT_DB_USER:-talos_product}:${PRODUCT_DB_PASSWORD}@postgres_product:5432/${PRODUCT_DB_NAME:-talos_product}
+      RAW_ARTIFACT_DIR: /var/lib/talos/raw
+      DIALPAD_WEBHOOK_SECRET: ${DIALPAD_WEBHOOK_SECRET}
+      GMAIL_OAUTH_CLIENT_ID: ${GMAIL_OAUTH_CLIENT_ID}
+      GMAIL_OAUTH_CLIENT_SECRET: ${GMAIL_OAUTH_CLIENT_SECRET}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - raw_artifacts:/var/lib/talos/raw
+    depends_on:
+      - postgres_product
+    networks: [product_net]
+
+  scheduler:
+    build:
+      context: ../../../../services/scheduler
+    container_name: talos_scheduler
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${PRODUCT_DB_USER:-talos_product}:${PRODUCT_DB_PASSWORD}@postgres_product:5432/${PRODUCT_DB_NAME:-talos_product}
+      LOCAL_WORKER_URL: ${LOCAL_WORKER_URL}
+      LOCAL_WORKER_TOKEN: ${LOCAL_WORKER_TOKEN}
+      WORKER_PING_INTERVAL_SEC: ${WORKER_PING_INTERVAL_SEC:-30}
+    depends_on:
+      - postgres_product
+    networks: [product_net]
+
+  contact_engine:
+    build:
+      context: ../../../../services/contact_engine
+    container_name: talos_contact_engine
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${PRODUCT_DB_USER:-talos_product}:${PRODUCT_DB_PASSWORD}@postgres_product:5432/${PRODUCT_DB_NAME:-talos_product}
+      CANDIDATE_PROMOTION_THRESHOLD: ${CANDIDATE_PROMOTION_THRESHOLD:-3}
+    depends_on:
+      - postgres_product
+    networks: [product_net]
+
+  matrix_bridge:
+    build:
+      context: ../../../../services/matrix_bridge
+    container_name: talos_matrix_bridge
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${PRODUCT_DB_USER:-talos_product}:${PRODUCT_DB_PASSWORD}@postgres_product:5432/${PRODUCT_DB_NAME:-talos_product}
+      AOR_DATABASE_URL: ${AOR_DATABASE_URL}
+      MATRIX_HOMESERVER_URL: ${MATRIX_HOMESERVER_URL}
+      MATRIX_BRIDGE_USER_TOKEN: ${MATRIX_BRIDGE_USER_TOKEN}
+      BRIDGE_RULES_PATH: /etc/talos/aor_bridge_rules.json
+      BRIDGE_EVENTS_PATH: /etc/talos/aor_bridge_events.json
+      BRIDGE_DRY_RUN: ${BRIDGE_DRY_RUN:-0}
+    volumes:
+      - ../../../../config/aor_bridge_rules.example.json:/etc/talos/aor_bridge_rules.json:ro
+      - ../../../../config/aor_bridge_events.example.json:/etc/talos/aor_bridge_events.json:ro
+    depends_on:
+      - postgres_product
+    networks: [product_net, aor_net]
+
+  deploy_hook:
+    build:
+      context: ../../../../services/deploy_hook
+    container_name: talos_deploy_hook
+    restart: unless-stopped
+    environment:
+      GITEA_WEBHOOK_SECRET: ${GITEA_WEBHOOK_SECRET}
+      REPO_DIR: /opt/talos/repo
+      COMPOSE_PROJECT: talos-product
+      COMPOSE_FILE: /opt/talos/repo/deploy/docker/aws/product/docker-compose.yml
+      HEALTHCHECK_URLS: ${HEALTHCHECK_URLS:-http://intake_api:8080/healthz}
+    volumes:
+      - ${REPO_HOST_DIR:-/opt/talos/repo}:/opt/talos/repo
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks: [product_net]
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: talos_caddy_product
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_product_data:/data
+      - caddy_product_config:/config
+    depends_on:
+      - intake_api
+      - deploy_hook
+    # Single-Caddy model: fronts intake.*, matrix.*, and chat.* by attaching
+    # to both product_net and aor_net.
+    networks: [product_net, aor_net]

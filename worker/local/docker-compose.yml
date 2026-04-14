@@ -1,0 +1,27 @@
+# TALOS Local Worker (Phase 1). Single combined worker service.
+name: talos-worker
+networks:
+  worker_net:
+    driver: bridge
+volumes:
+  worker_work:
+  worker_cache:
+services:
+  worker:
+    build:
+      context: ./app
+    container_name: talos_worker
+    restart: unless-stopped
+    environment:
+      PRODUCT_DATABASE_URL: ${PRODUCT_DATABASE_URL}
+      LOCAL_WORKER_TOKEN: ${LOCAL_WORKER_TOKEN}
+      ARTIFACT_ARCHIVE_DIR: /mnt/archive
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ENABLED_MODULES: ${ENABLED_MODULES:-transcription,behavior_analysis,contact_engine_local,baseline_updates,deferred_backfill}
+    volumes:
+      - worker_work:/var/lib/talos/work
+      - worker_cache:/root/.cache
+      # - //diskstation/talos-archive:/mnt/archive
+    ports:
+      - "8081:8081"
+    networks: [worker_net]
