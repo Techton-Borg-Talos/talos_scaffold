@@ -1,5 +1,5 @@
 """TALOS Product Deploy Hook."""
-"""This is a test of the Deploy""
+# deploy-hook auto-deploy verification test
 from __future__ import annotations
 
 import asyncio
