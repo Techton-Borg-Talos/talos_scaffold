@@ -128,20 +128,39 @@ def _parse_ps_output(raw: str) -> List[Dict]:
     if not raw:
         return []
 
+    rows: List[Dict] = []
+
     try:
         data = json.loads(raw)
+        if isinstance(data, list):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                rows.append(
+                    {
+                        "name": item.get("Name"),
+                        "service": item.get("Service"),
+                        "status": str(item.get("State", "")).lower(),
+                        "raw": item,
+                    }
+                )
+            return rows
     except json.JSONDecodeError:
-        LOG.error("failed to parse docker compose ps json output")
-        return []
+        pass
 
-    if not isinstance(data, list):
-        LOG.error("unexpected docker compose ps json output type: %s", type(data).__name__)
-        return []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            LOG.error("failed to parse docker compose ps json line: %r", line)
+            continue
 
-    rows: List[Dict] = []
-    for item in data:
         if not isinstance(item, dict):
             continue
+
         rows.append(
             {
                 "name": item.get("Name"),
@@ -150,6 +169,10 @@ def _parse_ps_output(raw: str) -> List[Dict]:
                 "raw": item,
             }
         )
+
+    if not rows:
+        LOG.error("failed to parse docker compose ps json output")
+
     return rows
 
 
@@ -203,7 +226,6 @@ async def _deploy(trigger: Dict) -> Dict:
                 timeout=600,
             )
         )
-
         entry["steps"].append(
             _run(
                 _compose_cmd("up", "-d", "--build", *DEPLOY_SERVICES),
