@@ -107,22 +107,6 @@ services:
       - postgres_product
     networks: [product_net, aor_net]
 
-  deploy_hook:
-    build:
-      context: ../../../../services/deploy_hook
-    container_name: talos_deploy_hook
-    restart: unless-stopped
-    environment:
-      GITEA_WEBHOOK_SECRET: ${GITEA_WEBHOOK_SECRET}
-      REPO_DIR: /opt/talos/repo
-      COMPOSE_PROJECT: talos-product
-      COMPOSE_FILE: /opt/talos/repo/deploy/docker/aws/product/docker-compose.yml
-      HEALTHCHECK_URLS: ${HEALTHCHECK_URLS:-http://intake_api:8080/healthz}
-    volumes:
-      - ${REPO_HOST_DIR:-/opt/talos/repo}:/opt/talos/repo
-      - /var/run/docker.sock:/var/run/docker.sock
-    networks: [product_net]
-
   caddy:
     image: caddy:2-alpine
     container_name: talos_caddy_product
@@ -136,7 +120,6 @@ services:
       - caddy_product_config:/config
     depends_on:
       - intake_api
-      - deploy_hook
     # Single-Caddy model: fronts intake.*, matrix.*, and chat.* by attaching
     # to both product_net and aor_net.
     networks: [product_net, aor_net]
