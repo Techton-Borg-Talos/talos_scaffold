@@ -1,5 +1,4 @@
 """TALOS Product Deploy Hook."""
-# deploy-hook auto-deploy verification test
 from __future__ import annotations
 
 import asyncio
@@ -34,7 +33,16 @@ REQUIRED_SERVICES = [
     s.strip()
     for s in os.environ.get(
         "REQUIRED_SERVICES",
-        "postgres_product,deploy_hook,intake_api,scheduler,contact_engine,matrix_bridge,caddy",
+        "postgres_product,intake_api,scheduler,contact_engine,matrix_bridge,caddy",
+    ).split(",")
+    if s.strip()
+]
+
+DEPLOY_SERVICES = [
+    s.strip()
+    for s in os.environ.get(
+        "DEPLOY_SERVICES",
+        "postgres_product,intake_api,scheduler,contact_engine,matrix_bridge,caddy",
     ).split(",")
     if s.strip()
 ]
@@ -42,7 +50,7 @@ REQUIRED_SERVICES = [
 DEPLOY_LOG: Deque[Dict] = deque(maxlen=50)
 _lock = asyncio.Lock()
 
-app = FastAPI(title="talos-deploy-hook", version="0.2.0")
+app = FastAPI(title="talos-deploy-hook", version="0.3.0")
 
 
 def _verify(body: bytes, sig: Optional[str]) -> bool:
@@ -189,16 +197,15 @@ async def _deploy(trigger: Dict) -> Dict:
             )
         )
 
-        # One command that builds and starts the stack, matching the manual recovery path.
+        # Redeploy product services, but do NOT redeploy deploy_hook itself.
         entry["steps"].append(
             _run(
-                _compose_cmd("up", "-d", "--build"),
+                _compose_cmd("up", "-d", "--build", *DEPLOY_SERVICES),
                 cwd=compose_dir,
                 timeout=1800,
             )
         )
 
-        # Give containers a moment to settle, then inspect status.
         await asyncio.sleep(5)
 
         ps_step = _run(_compose_cmd("ps"), cwd=compose_dir, timeout=120)
