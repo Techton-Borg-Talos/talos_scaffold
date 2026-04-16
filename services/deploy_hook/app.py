@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 import os
 import subprocess
@@ -50,7 +51,7 @@ DEPLOY_SERVICES = [
 DEPLOY_LOG: Deque[Dict] = deque(maxlen=50)
 _lock = asyncio.Lock()
 
-app = FastAPI(title="talos-deploy-hook", version="0.3.0")
+app = FastAPI(title="talos-deploy-hook", version="0.4.0")
 
 
 def _verify(body: bytes, sig: Optional[str]) -> bool:
@@ -75,8 +76,8 @@ def _run(cmd: List[str], cwd: Optional[str] = None, timeout: int = 600) -> Dict:
         return {
             "cmd": cmd,
             "rc": proc.returncode,
-            "stdout_tail": proc.stdout[-4000:],
-            "stderr_tail": proc.stderr[-4000:],
+            "stdout_tail": proc.stdout[-12000:],
+            "stderr_tail": proc.stderr[-12000:],
             "duration_s": round(time.time() - started, 2),
         }
     except subprocess.TimeoutExpired as e:
@@ -123,31 +124,37 @@ def _compose_cmd(*args: str) -> List[str]:
 
 
 def _parse_ps_output(raw: str) -> List[Dict]:
-    lines = [line for line in raw.splitlines() if line.strip()]
-    if len(lines) <= 1:
+    raw = raw.strip()
+    if not raw:
         return []
 
-    services: List[Dict] = []
-    for line in lines[1:]:
-        parts = line.split()
-        if len(parts) < 5:
-            continue
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        LOG.error("failed to parse docker compose ps json output")
+        return []
 
-        service = parts[3]
-        status = " ".join(parts[4:])
-        services.append(
+    if not isinstance(data, list):
+        LOG.error("unexpected docker compose ps json output type: %s", type(data).__name__)
+        return []
+
+    rows: List[Dict] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        rows.append(
             {
-                "name": parts[0],
-                "service": service,
-                "status": status,
-                "raw": line,
+                "name": item.get("Name"),
+                "service": item.get("Service"),
+                "status": str(item.get("State", "")).lower(),
+                "raw": item,
             }
         )
-    return services
+    return rows
 
 
 def _check_services(ps_rows: List[Dict]) -> Dict:
-    by_service = {row["service"]: row for row in ps_rows}
+    by_service = {row["service"]: row for row in ps_rows if row.get("service")}
 
     missing = [svc for svc in REQUIRED_SERVICES if svc not in by_service]
     unhealthy = []
@@ -155,7 +162,7 @@ def _check_services(ps_rows: List[Dict]) -> Dict:
         row = by_service.get(svc)
         if not row:
             continue
-        if not row["status"].startswith("Up"):
+        if row["status"] != "running":
             unhealthy.append(
                 {
                     "service": svc,
@@ -197,7 +204,6 @@ async def _deploy(trigger: Dict) -> Dict:
             )
         )
 
-        # Redeploy product services, but do NOT redeploy deploy_hook itself.
         entry["steps"].append(
             _run(
                 _compose_cmd("up", "-d", "--build", *DEPLOY_SERVICES),
@@ -208,11 +214,15 @@ async def _deploy(trigger: Dict) -> Dict:
 
         await asyncio.sleep(5)
 
-        ps_step = _run(_compose_cmd("ps"), cwd=compose_dir, timeout=120)
+        ps_step = _run(
+            _compose_cmd("ps", "--format", "json"),
+            cwd=compose_dir,
+            timeout=120,
+        )
         entry["steps"].append(ps_step)
+
         ps_rows = _parse_ps_output(ps_step.get("stdout_tail", ""))
         entry["service_check"] = _check_services(ps_rows)
-
         entry["health"] = await _health()
 
         step_fail = any(step.get("rc", 0) != 0 for step in entry["steps"])
