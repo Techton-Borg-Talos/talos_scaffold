@@ -1,14 +1,15 @@
-"""TALOS Intake API. Archive-first (Rule 1) + normalized event insert."""
+"""TALOS Intake API. Archive-first + normalized event and participant insert."""
 from __future__ import annotations
 
 import hashlib
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import asyncpg
 import jwt
@@ -23,7 +24,7 @@ RAW.mkdir(parents=True, exist_ok=True)
 DIALPAD_SECRET = os.environ.get("DIALPAD_WEBHOOK_SECRET", "")
 DATABASE_URL = os.environ["DATABASE_URL"]
 
-app = FastAPI(title="talos-intake", version="0.2.0")
+app = FastAPI(title="talos-intake", version="0.3.0")
 _pool: Optional[asyncpg.Pool] = None
 
 
@@ -46,16 +47,16 @@ async def healthz():
 
 
 def _archive(source: str, raw: bytes, content_type: str) -> Dict:
-    au = uuid.uuid4()
+    artifact_uuid = uuid.uuid4()
     sha = hashlib.sha256(raw).hexdigest()
-    sd = RAW / source / sha[:2]
-    sd.mkdir(parents=True, exist_ok=True)
-    p = sd / f"{au}.bin"
-    p.write_bytes(raw)
+    subdir = RAW / source / sha[:2]
+    subdir.mkdir(parents=True, exist_ok=True)
+    path = subdir / f"{artifact_uuid}.bin"
+    path.write_bytes(raw)
     return {
-        "artifact_uuid": str(au),
+        "artifact_uuid": str(artifact_uuid),
         "storage_scheme": "local",
-        "storage_uri": str(p),
+        "storage_uri": str(path),
         "sha256": sha,
         "byte_size": len(raw),
         "content_type": content_type,
@@ -63,11 +64,6 @@ def _archive(source: str, raw: bytes, content_type: str) -> Dict:
 
 
 def _decode_dialpad_event(raw: bytes) -> Dict:
-    """
-    Dialpad webhook behavior:
-    - if secret is provided: body is JWT signed with HS256
-    - if no secret is provided: body is plain JSON
-    """
     text = raw.decode("utf-8", errors="replace").strip()
 
     if DIALPAD_SECRET:
@@ -106,15 +102,35 @@ def _ms_to_ts(ms: Optional[object]) -> datetime:
         return datetime.now(timezone.utc)
 
 
+def _normalize_email(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    v = value.strip().lower()
+    return v or None
+
+
+def _normalize_phone(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    digits = re.sub(r"\D+", "", value)
+    if not digits:
+        return None
+    if len(digits) == 10:
+        return f"+1{digits}"
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    if value.strip().startswith("+") and digits:
+        return f"+{digits}"
+    return f"+{digits}"
+
+
 def _channel_and_external_id(evt: Dict) -> Tuple[str, str]:
-    # SMS payloads do not carry call_id; calls/voicemails do.
     if "call_id" in evt:
         state = str(evt.get("state") or "").lower()
         if state in {"voicemail", "voicemail_uploaded", "transcription"}:
             return "voicemail", str(evt["call_id"])
         return "call", str(evt["call_id"])
 
-    # SMS/message payload
     if "id" in evt:
         return "sms", str(evt["id"])
 
@@ -128,32 +144,128 @@ def _direction(evt: Dict) -> str:
     return "unknown"
 
 
-def _remote_identifier(evt: Dict, channel: str) -> Optional[str]:
-    if channel in {"call", "voicemail"}:
-        return evt.get("external_number") or evt.get("contact", {}).get("phone")
-    # sms
-    return evt.get("from_number") or evt.get("contact", {}).get("phone")
-
-
-def _local_identifier(evt: Dict, channel: str) -> Optional[str]:
-    if channel in {"call", "voicemail"}:
-        return evt.get("internal_number") or evt.get("target", {}).get("phone")
-    to_number = evt.get("to_number")
-    if isinstance(to_number, list) and to_number:
-        return to_number[0]
-    return evt.get("target", {}).get("phone")
-
-
 def _subject(evt: Dict, channel: str) -> Optional[str]:
     if channel == "sms":
         txt = evt.get("text_content") or evt.get("text")
         if txt:
             return str(txt)[:255]
         return "dialpad sms"
+
     state = evt.get("state")
     if state:
         return f"dialpad {channel} {state}"
     return f"dialpad {channel}"
+
+
+def _event_identity_fields(evt: Dict, channel: str) -> Tuple[Optional[str], Optional[str]]:
+    if channel in {"call", "voicemail"}:
+        remote_identifier = _normalize_phone(
+            evt.get("external_number") or (evt.get("contact") or {}).get("phone")
+        )
+        local_identifier = _normalize_phone(
+            evt.get("internal_number") or (evt.get("target") or {}).get("phone")
+        )
+        return remote_identifier, local_identifier
+
+    remote_identifier = _normalize_phone(
+        evt.get("from_number") or (evt.get("contact") or {}).get("phone")
+    )
+    to_number = evt.get("to_number")
+    if isinstance(to_number, list) and to_number:
+        local_identifier = _normalize_phone(to_number[0])
+    else:
+        local_identifier = _normalize_phone((evt.get("target") or {}).get("phone"))
+    return remote_identifier, local_identifier
+
+
+def _dialpad_participants(evt: Dict, channel: str) -> List[Dict]:
+    participants: List[Dict] = []
+
+    contact = evt.get("contact") or {}
+    target = evt.get("target") or {}
+
+    if channel in {"call", "voicemail"}:
+        participants.append(
+            {
+                "participant_index": 0,
+                "role": "counterparty",
+                "display_name": contact.get("name"),
+                "email_raw": contact.get("email"),
+                "email_normalized": _normalize_email(contact.get("email")),
+                "phone_raw": contact.get("phone"),
+                "phone_normalized": _normalize_phone(contact.get("phone")),
+                "source_person_id": str(contact.get("id")) if contact.get("id") is not None else None,
+                "source_system": "dialpad",
+                "is_internal": False,
+            }
+        )
+        participants.append(
+            {
+                "participant_index": 1,
+                "role": "target",
+                "display_name": target.get("name"),
+                "email_raw": target.get("email"),
+                "email_normalized": _normalize_email(target.get("email")),
+                "phone_raw": target.get("phone"),
+                "phone_normalized": _normalize_phone(target.get("phone")),
+                "source_person_id": str(target.get("id")) if target.get("id") is not None else None,
+                "source_system": "dialpad",
+                "is_internal": True,
+            }
+        )
+        return participants
+
+    participants.append(
+        {
+            "participant_index": 0,
+            "role": "sender",
+            "display_name": contact.get("name"),
+            "email_raw": contact.get("email"),
+            "email_normalized": _normalize_email(contact.get("email")),
+            "phone_raw": evt.get("from_number") or contact.get("phone"),
+            "phone_normalized": _normalize_phone(evt.get("from_number") or contact.get("phone")),
+            "source_person_id": str(contact.get("id")) if contact.get("id") is not None else None,
+            "source_system": "dialpad",
+            "is_internal": False,
+        }
+    )
+
+    to_number = evt.get("to_number")
+    to_numbers = to_number if isinstance(to_number, list) else [to_number] if to_number else []
+
+    if to_numbers:
+        for idx, phone in enumerate(to_numbers, start=1):
+            participants.append(
+                {
+                    "participant_index": idx,
+                    "role": "recipient",
+                    "display_name": target.get("name") if idx == 1 else None,
+                    "email_raw": target.get("email") if idx == 1 else None,
+                    "email_normalized": _normalize_email(target.get("email") if idx == 1 else None),
+                    "phone_raw": phone,
+                    "phone_normalized": _normalize_phone(phone),
+                    "source_person_id": str(target.get("id")) if idx == 1 and target.get("id") is not None else None,
+                    "source_system": "dialpad",
+                    "is_internal": True,
+                }
+            )
+    else:
+        participants.append(
+            {
+                "participant_index": 1,
+                "role": "recipient",
+                "display_name": target.get("name"),
+                "email_raw": target.get("email"),
+                "email_normalized": _normalize_email(target.get("email")),
+                "phone_raw": target.get("phone"),
+                "phone_normalized": _normalize_phone(target.get("phone")),
+                "source_person_id": str(target.get("id")) if target.get("id") is not None else None,
+                "source_system": "dialpad",
+                "is_internal": True,
+            }
+        )
+
+    return participants
 
 
 async def _insert_communication_event(evt: Dict, artifact: Dict) -> Dict:
@@ -168,16 +280,53 @@ async def _insert_communication_event(evt: Dict, artifact: Dict) -> Dict:
         or evt.get("date_connected")
         or evt.get("date_ended")
     )
-    remote_identifier = _remote_identifier(evt, channel)
-    local_identifier = _local_identifier(evt, channel)
+    remote_identifier, local_identifier = _event_identity_fields(evt, channel)
     subject = _subject(evt, channel)
+    participants = _dialpad_participants(evt, channel)
 
     async with _pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO communication_events
-            (
-                source_system,
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                INSERT INTO communication_events
+                (
+                    source_system,
+                    channel,
+                    direction,
+                    external_id,
+                    remote_identifier,
+                    local_identifier,
+                    occurred_at,
+                    subject,
+                    source_metadata,
+                    verified
+                )
+                VALUES
+                (
+                    'dialpad'::source_system,
+                    $1::event_channel,
+                    $2::event_direction,
+                    $3,
+                    $4,
+                    $5,
+                    $6,
+                    $7,
+                    $8::jsonb,
+                    TRUE
+                )
+                ON CONFLICT (source_system, external_id)
+                DO UPDATE SET
+                    channel = EXCLUDED.channel,
+                    direction = EXCLUDED.direction,
+                    remote_identifier = EXCLUDED.remote_identifier,
+                    local_identifier = EXCLUDED.local_identifier,
+                    occurred_at = EXCLUDED.occurred_at,
+                    subject = EXCLUDED.subject,
+                    source_metadata = EXCLUDED.source_metadata,
+                    verified = TRUE,
+                    updated_at = now()
+                RETURNING event_uuid
+                """,
                 channel,
                 direction,
                 external_id,
@@ -185,85 +334,104 @@ async def _insert_communication_event(evt: Dict, artifact: Dict) -> Dict:
                 local_identifier,
                 occurred_at,
                 subject,
-                source_metadata,
-                verified
+                json.dumps(evt),
             )
-            VALUES
-            (
-                'dialpad'::source_system,
-                $1::event_channel,
-                $2::event_direction,
-                $3,
-                $4,
-                $5,
-                $6,
-                $7,
-                $8::jsonb,
-                TRUE
-            )
-            ON CONFLICT (source_system, external_id)
-            DO UPDATE SET
-                channel = EXCLUDED.channel,
-                direction = EXCLUDED.direction,
-                remote_identifier = EXCLUDED.remote_identifier,
-                local_identifier = EXCLUDED.local_identifier,
-                occurred_at = EXCLUDED.occurred_at,
-                subject = EXCLUDED.subject,
-                source_metadata = EXCLUDED.source_metadata,
-                verified = TRUE,
-                updated_at = now()
-            RETURNING event_uuid
-            """,
-            channel,
-            direction,
-            external_id,
-            remote_identifier,
-            local_identifier,
-            occurred_at,
-            subject,
-            json.dumps(evt),
-        )
 
-        await conn.execute(
-            """
-            INSERT INTO event_artifacts
-            (
+            event_uuid = row["event_uuid"]
+
+            await conn.execute(
+                """
+                DELETE FROM event_participants
+                WHERE event_uuid = $1
+                """,
                 event_uuid,
-                kind,
-                storage_scheme,
-                storage_uri,
-                sha256,
-                byte_size,
-                content_type,
-                metadata
             )
-            VALUES
-            (
-                $1,
-                'webhook_raw',
-                $2,
-                $3,
-                $4,
-                $5,
-                $6,
-                $7::jsonb
-            )
-            ON CONFLICT DO NOTHING
-            """,
-            row["event_uuid"],
-            artifact["storage_scheme"],
-            artifact["storage_uri"],
-            artifact["sha256"],
-            artifact["byte_size"],
-            artifact["content_type"],
-            json.dumps({"artifact_uuid": artifact["artifact_uuid"]}),
-        )
 
-        return {
-            "event_uuid": str(row["event_uuid"]),
-            "channel": channel,
-            "external_id": external_id,
-        }
+            for p in participants:
+                await conn.execute(
+                    """
+                    INSERT INTO event_participants
+                    (
+                        event_uuid,
+                        participant_index,
+                        role,
+                        display_name,
+                        email_raw,
+                        email_normalized,
+                        phone_raw,
+                        phone_normalized,
+                        source_person_id,
+                        source_system,
+                        is_internal
+                    )
+                    VALUES
+                    (
+                        $1,
+                        $2,
+                        $3,
+                        $4,
+                        $5,
+                        $6,
+                        $7,
+                        $8,
+                        $9,
+                        $10::source_system,
+                        $11
+                    )
+                    """,
+                    event_uuid,
+                    p["participant_index"],
+                    p["role"],
+                    p["display_name"],
+                    p["email_raw"],
+                    p["email_normalized"],
+                    p["phone_raw"],
+                    p["phone_normalized"],
+                    p["source_person_id"],
+                    p["source_system"],
+                    p["is_internal"],
+                )
+
+            await conn.execute(
+                """
+                INSERT INTO event_artifacts
+                (
+                    event_uuid,
+                    kind,
+                    storage_scheme,
+                    storage_uri,
+                    sha256,
+                    byte_size,
+                    content_type,
+                    metadata
+                )
+                VALUES
+                (
+                    $1,
+                    'webhook_raw',
+                    $2,
+                    $3,
+                    $4,
+                    $5,
+                    $6,
+                    $7::jsonb
+                )
+                """,
+                event_uuid,
+                artifact["storage_scheme"],
+                artifact["storage_uri"],
+                artifact["sha256"],
+                artifact["byte_size"],
+                artifact["content_type"],
+                json.dumps({"artifact_uuid": artifact["artifact_uuid"]}),
+            )
+
+            return {
+                "event_uuid": str(event_uuid),
+                "channel": channel,
+                "external_id": external_id,
+                "participant_count": len(participants),
+            }
 
 
 @app.post("/webhooks/dialpad")
@@ -276,11 +444,12 @@ async def dialpad(request: Request):
     normalized = await _insert_communication_event(evt, artifact)
 
     LOG.info(
-        "dialpad accepted: artifact=%s event_uuid=%s channel=%s external_id=%s",
+        "dialpad accepted: artifact=%s event_uuid=%s channel=%s external_id=%s participants=%s",
         artifact["artifact_uuid"],
         normalized["event_uuid"],
         normalized["channel"],
         normalized["external_id"],
+        normalized["participant_count"],
     )
 
     return {
@@ -288,6 +457,7 @@ async def dialpad(request: Request):
         "artifact_uuid": artifact["artifact_uuid"],
         "event_uuid": normalized["event_uuid"],
         "channel": normalized["channel"],
+        "participant_count": normalized["participant_count"],
     }
 
 
