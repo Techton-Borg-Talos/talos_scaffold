@@ -208,3 +208,13 @@ The following Phase 1 components have been validated together:
 * Element
 * Matrix bridge delivery
 * Gitea deploy webhook
+
+
+AWS auto-deploy notes:
+- AWS repo path: /opt/talos/repo
+- Product stack: deploy/docker/aws/product/docker-compose.yml
+- Deployer stack: deploy/docker/aws/deployer/docker-compose.yml
+- Deployer build context: services/deploy_hook
+- Gitea remote uses SSH
+- deploy hook container must include openssh-client for git fetch
+- deploy hook is exposed on product_net to Caddy, not published to host localhost
