@@ -218,3 +218,19 @@ AWS auto-deploy notes:
 - Gitea remote uses SSH
 - deploy hook container must include openssh-client for git fetch
 - deploy hook is exposed on product_net to Caddy, not published to host localhost
+
+Post-reboot verification:
+cd /opt/talos/repo
+git rev-parse HEAD
+sudo docker ps --format "table {{.Names}}\t{{.Status}}"
+
+Deploy hook live logs:
+sudo docker logs -f talos_deploy_hook
+
+Force deployer rebuild:
+sudo docker compose --project-name talos-deployer \
+  -f /opt/talos/repo/deploy/docker/aws/deployer/docker-compose.yml \
+  build --no-cache
+sudo docker compose --project-name talos-deployer \
+  -f /opt/talos/repo/deploy/docker/aws/deployer/docker-compose.yml \
+  up -d
