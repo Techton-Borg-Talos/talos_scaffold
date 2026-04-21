@@ -3,9 +3,13 @@
 # Compose project name: talos-product
 # This stack is the commercializable product side. The `caddy` service here
 # is the SINGLE host-wide Caddy that fronts all three public vhosts:
-#   intake.taloscognitive.com -> this stack (intake_api + deploy_hook)
+#   intake.taloscognitive.com -> this stack (intake_api)
 #   matrix.taloscognitive.com -> talos-aor synapse (via aor_net)
 #   chat.taloscognitive.com   -> talos-aor element (via aor_net)
+#
+# deploy_hook lives in its own compose project (talos-deployer) so it
+# never self-terminates during a deploy. It attaches to product_net as
+# an external network.
 #
 # Only the single Caddy crosses the network boundary to reach AoR.
 # AoR and Product otherwise stay fully separate (different compose project,
@@ -122,4 +126,5 @@ services:
       - intake_api
     # Single-Caddy model: fronts intake.*, matrix.*, and chat.* by attaching
     # to both product_net and aor_net.
+    # deploy_hook is reached via product_net from talos-deployer (external).
     networks: [product_net, aor_net]
