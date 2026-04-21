@@ -1,5 +1,5 @@
 """TALOS Product Deploy Hook.
-#This is a test
+
 Receives Gitea push webhooks and redeploys the talos-product stack.
 Lives in its own compose project (talos-deployer) so it never
 self-terminates during a deploy.
