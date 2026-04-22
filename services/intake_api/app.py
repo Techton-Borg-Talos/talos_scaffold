@@ -356,6 +356,7 @@ def _provider_transcript_payload(evt: Dict, channel: str, event_uuid: str) -> Op
 def _provider_recording_artifacts(evt: Dict, channel: str, event_uuid: str) -> List[Dict]:
     provenance = _source_provenance(evt, channel)
     refs: List[Dict] = []
+    recording_details = evt.get("recording_details") or []
 
     voicemail_link = evt.get("voicemail_link")
     if voicemail_link:
@@ -388,6 +389,31 @@ def _provider_recording_artifacts(evt: Dict, channel: str, event_uuid: str) -> L
                     "provider": "dialpad",
                     "reference_type": "voicemail_recording_id",
                     "recording_id": voicemail_recording_id,
+                    "source_provenance": provenance,
+                },
+            }
+        )
+
+    for detail in recording_details:
+        if not isinstance(detail, dict):
+            continue
+        detail_url = detail.get("url")
+        if not detail_url:
+            continue
+        refs.append(
+            {
+                "event_uuid": event_uuid,
+                "kind": "provider_recording_reference",
+                "storage_scheme": "dialpad",
+                "storage_uri": str(detail_url),
+                "content_type": "text/uri-list",
+                "metadata": {
+                    "provider": "dialpad",
+                    "reference_type": "recording_detail_url",
+                    "recording_id": detail.get("id"),
+                    "recording_type": detail.get("recording_type"),
+                    "duration_ms": detail.get("duration"),
+                    "start_time": detail.get("start_time"),
                     "source_provenance": provenance,
                 },
             }
