@@ -1,0 +1,37 @@
+{
+  "archive_timezone": "America/New_York",
+  "channel": "sms",
+  "company_slug": "INC",
+  "event_stem": "+18433847006_2026-04-22T16-12-26_text",
+  "event_uuid": "6eb49724-4728-4bae-a494-0e67f8990ca1",
+  "external_id": "5922579288236032",
+  "occurred_at": "2026-04-22T20:12:26.962000+00:00",
+  "recording_references": [],
+  "source_provenance": {
+    "call_id": null,
+    "channel": "sms",
+    "contact": {
+      "email": null,
+      "id": "6230146640257024",
+      "name": "Chris Epps",
+      "phone": "+18433847006",
+      "type": "local"
+    },
+    "direction": "inbound",
+    "external_id": "5922579288236032",
+    "external_number": null,
+    "from_number": "+18433847006",
+    "internal_number": null,
+    "selected_caller_id": null,
+    "source_system": "dialpad",
+    "target": {
+      "email": "cre@incirclearchitecture.com",
+      "id": "4703901367410688",
+      "name": "Christopher Epps",
+      "office_id": "4943523498434560",
+      "phone": "+18435648622",
+      "type": "user"
+    }
+  },
+  "subject": "Test my phone"
+}

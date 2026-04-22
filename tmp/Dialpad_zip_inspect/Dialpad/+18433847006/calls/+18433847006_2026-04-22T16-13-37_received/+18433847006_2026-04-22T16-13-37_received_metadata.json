@@ -1,0 +1,37 @@
+{
+  "archive_timezone": "America/New_York",
+  "channel": "call",
+  "company_slug": "INC",
+  "event_stem": "+18433847006_2026-04-22T16-13-37_received",
+  "event_uuid": "0606d573-6e93-42b3-b8e6-feff63120004",
+  "external_id": "5849463509819392",
+  "occurred_at": "2026-04-22T20:13:37.157000+00:00",
+  "recording_references": [],
+  "source_provenance": {
+    "call_id": "5849463509819392",
+    "channel": "call",
+    "contact": {
+      "email": null,
+      "id": "4817995122876416",
+      "name": "Chris Epps",
+      "phone": "+18433847006",
+      "type": "local"
+    },
+    "direction": "inbound",
+    "external_id": "5849463509819392",
+    "external_number": "+18433847006",
+    "from_number": null,
+    "internal_number": "+18435939506",
+    "selected_caller_id": null,
+    "source_system": "dialpad",
+    "target": {
+      "email": null,
+      "id": "4943523498434560",
+      "name": "Incircle Architecture",
+      "office_id": "4943523498434560",
+      "phone": "+18435939506",
+      "type": "office"
+    }
+  },
+  "subject": "dialpad call hangup"
+}

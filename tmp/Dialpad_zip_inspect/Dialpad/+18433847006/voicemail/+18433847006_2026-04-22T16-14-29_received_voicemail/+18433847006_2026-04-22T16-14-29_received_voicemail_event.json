@@ -1,0 +1,83 @@
+{
+  "_talos": {
+    "source_provenance": {
+      "call_id": "4996515619741696",
+      "channel": "voicemail",
+      "contact": {
+        "email": null,
+        "id": "4817995122876416",
+        "name": "Chris Epps",
+        "phone": "+18433847006",
+        "type": "local"
+      },
+      "direction": "inbound",
+      "external_id": "4996515619741696",
+      "external_number": "+18433847006",
+      "from_number": null,
+      "internal_number": "+18435939506",
+      "selected_caller_id": null,
+      "source_system": "dialpad",
+      "target": {
+        "email": null,
+        "id": "4912887161167872",
+        "name": "General Information",
+        "office_id": "4943523498434560",
+        "phone": null,
+        "type": "department"
+      }
+    }
+  },
+  "call_id": 4996515619741696,
+  "call_recording_ids": [],
+  "callback_requested": null,
+  "contact": {
+    "email": "",
+    "id": 4817995122876416,
+    "name": "Chris Epps",
+    "phone": "+18433847006",
+    "type": "local"
+  },
+  "csat_score": null,
+  "date_connected": null,
+  "date_ended": 1776888868541,
+  "date_first_rang": null,
+  "date_queued": null,
+  "date_rang": null,
+  "date_started": 1776888844417,
+  "direction": "inbound",
+  "duration": 0,
+  "entry_point_call_id": null,
+  "entry_point_target": {},
+  "event_timestamp": 1776888869954,
+  "external_number": "+18433847006",
+  "group_id": "OfficeGroup:4912887161167872",
+  "hold_time": 0,
+  "integrations": {},
+  "internal_number": "+18435939506",
+  "is_transferred": false,
+  "labels": [],
+  "master_call_id": 5392401311014912,
+  "mos_score": 4.41,
+  "operator_call_id": null,
+  "proxy_target": {},
+  "recording_details": [],
+  "routing_breadcrumbs": [],
+  "selected_caller_id": null,
+  "state": "voicemail_uploaded",
+  "talk_time": 0,
+  "target": {
+    "email": "",
+    "id": 4912887161167872,
+    "name": "General Information",
+    "office_id": 4943523498434560,
+    "phone": null,
+    "type": "department"
+  },
+  "target_availability_status": "open",
+  "total_duration": 24123.163,
+  "transcription_text": null,
+  "voicemail_link": "https://dialpad.com/v/4996515619741696",
+  "voicemail_recording_id": "763a97e5-5591-4075-ac96-a15aa108e6fe",
+  "voicemail_share_link": "https://dialpad.com/recording/voicemail/oLOcc9Sz1QigndC48v4UHEBfw73R5jRZj38x7fubIo5S",
+  "was_recorded": false
+}

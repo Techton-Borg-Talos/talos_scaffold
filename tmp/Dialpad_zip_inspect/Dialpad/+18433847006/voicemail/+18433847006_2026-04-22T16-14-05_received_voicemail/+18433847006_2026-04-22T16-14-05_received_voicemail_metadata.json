@@ -1,0 +1,75 @@
+{
+  "archive_timezone": "America/New_York",
+  "channel": "voicemail",
+  "company_slug": "INC",
+  "event_stem": "+18433847006_2026-04-22T16-14-05_received_voicemail",
+  "event_uuid": "3aaf9b58-b382-47dd-92cc-4bc07d886043",
+  "external_id": "4996515619741696",
+  "occurred_at": "2026-04-22T20:14:05.565000+00:00",
+  "recording_references": [
+    {
+      "content_type": "text/uri-list",
+      "kind": "provider_recording_reference",
+      "metadata": {
+        "provider": "dialpad",
+        "reference_type": "voicemail_link",
+        "source_provenance": {
+          "call_id": "4996515619741696",
+          "channel": "voicemail",
+          "contact": {
+            "email": null,
+            "id": "4817995122876416",
+            "name": "Chris Epps",
+            "phone": "+18433847006",
+            "type": "local"
+          },
+          "direction": "inbound",
+          "external_id": "4996515619741696",
+          "external_number": "+18433847006",
+          "from_number": null,
+          "internal_number": "+18435939506",
+          "selected_caller_id": null,
+          "source_system": "dialpad",
+          "target": {
+            "email": null,
+            "id": "4912887161167872",
+            "name": "General Information",
+            "office_id": "4943523498434560",
+            "phone": null,
+            "type": "department"
+          }
+        },
+        "voicemail_recording_id": null
+      },
+      "storage_scheme": "dialpad",
+      "storage_uri": "https://dialpad.com/v/4996515619741696"
+    }
+  ],
+  "source_provenance": {
+    "call_id": "4996515619741696",
+    "channel": "voicemail",
+    "contact": {
+      "email": null,
+      "id": "4817995122876416",
+      "name": "Chris Epps",
+      "phone": "+18433847006",
+      "type": "local"
+    },
+    "direction": "inbound",
+    "external_id": "4996515619741696",
+    "external_number": "+18433847006",
+    "from_number": null,
+    "internal_number": "+18435939506",
+    "selected_caller_id": null,
+    "source_system": "dialpad",
+    "target": {
+      "email": null,
+      "id": "4912887161167872",
+      "name": "General Information",
+      "office_id": "4943523498434560",
+      "phone": null,
+      "type": "department"
+    }
+  },
+  "subject": "dialpad voicemail voicemail"
+}

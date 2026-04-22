@@ -6,6 +6,12 @@ networks:
 volumes:
   worker_work:
   worker_cache:
+  dialpad_archive:
+    driver: local
+    driver_opts:
+      type: cifs
+      o: username=${SYNOLOGY_SMB_USER},password=${SYNOLOGY_SMB_PASS},vers=${SYNOLOGY_SMB_VERS:-3.0},uid=0,gid=0,file_mode=0664,dir_mode=0775,iocharset=utf8
+      device: //${SYNOLOGY_SMB_HOST}/${SYNOLOGY_SMB_SHARE}
 services:
   worker:
     build:
@@ -18,7 +24,7 @@ services:
       PRODUCT_WRITEBACK_URL: ${PRODUCT_WRITEBACK_URL}
       PRODUCT_WRITEBACK_TOKEN: ${PRODUCT_WRITEBACK_TOKEN}
       ARTIFACT_ARCHIVE_DIR: /mnt/archive
-      DIALPAD_ARCHIVE_DIR: /mnt/dialpad_archive
+      DIALPAD_ARCHIVE_DIR: /mnt/dialpad_archive/Historical/Dialpad
       DIALPAD_COMPANY_MAP_JSON: ${DIALPAD_COMPANY_MAP_JSON:-}
       DIALPAD_COMPANY_FALLBACK: ${DIALPAD_COMPANY_FALLBACK:-UNMAPPED}
       DIALPAD_ARCHIVE_TIMEZONE: ${DIALPAD_ARCHIVE_TIMEZONE:-America/New_York}
@@ -40,9 +46,7 @@ services:
     volumes:
       - worker_work:/var/lib/talos/work
       - worker_cache:/root/.cache
-      - type: bind
-        source: ${DIALPAD_ARCHIVE_HOST_PATH}
-        target: /mnt/dialpad_archive
+      - dialpad_archive:/mnt/dialpad_archive
       # - //diskstation/talos-archive:/mnt/archive
     ports:
       - "8081:8081"

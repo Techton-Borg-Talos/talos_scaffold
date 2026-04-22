@@ -1,0 +1,37 @@
+{
+  "archive_timezone": "America/New_York",
+  "channel": "call",
+  "company_slug": "INC",
+  "event_stem": "+18435648622_2026-04-22T16-13-45_sent",
+  "event_uuid": "6a75fa82-deb6-4624-b73d-01c384fad68d",
+  "external_id": "6227487338078208",
+  "occurred_at": "2026-04-22T20:13:45.399000+00:00",
+  "recording_references": [],
+  "source_provenance": {
+    "call_id": "6227487338078208",
+    "channel": "call",
+    "contact": {
+      "email": "cre@incirclearchitecture.com",
+      "id": "4703901367410688",
+      "name": "Christopher Epps",
+      "phone": "+18435648622",
+      "type": "user"
+    },
+    "direction": "outbound",
+    "external_id": "6227487338078208",
+    "external_number": "+18435648622",
+    "from_number": null,
+    "internal_number": "+18435648622",
+    "selected_caller_id": null,
+    "source_system": "dialpad",
+    "target": {
+      "email": "cre@incirclearchitecture.com",
+      "id": "4703901367410688",
+      "name": "Christopher Epps",
+      "office_id": "4943523498434560",
+      "phone": "+18435648622",
+      "type": "user"
+    }
+  },
+  "subject": "dialpad call hangup"
+}

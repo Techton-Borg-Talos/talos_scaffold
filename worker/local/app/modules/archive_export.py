@@ -160,6 +160,14 @@ def _manifest_entry(path: Path, content_type: str, metadata: Dict[str, Any], byt
     }
 
 
+def _load_json_file(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def _stem_suffix(channel: str, source_provenance: Dict[str, Any]) -> str:
     direction = str(source_provenance.get("direction") or "").lower()
     if channel == "sms":
@@ -222,6 +230,131 @@ def _guess_audio_extension(content_type: str, url: str) -> str:
     if match:
         return f".{match.group(1).lower()}"
     return ".mp3"
+
+
+def _manifest_path(archive_dir: Path, event_stem: str) -> Path:
+    return archive_dir / f"{event_stem}_manifest.json"
+
+
+def _load_manifest_entries(archive_dir: Path, event_stem: str) -> List[Dict[str, Any]]:
+    manifest_path = _manifest_path(archive_dir, event_stem)
+    payload = _load_json_file(manifest_path)
+    entries = payload.get("archive_files") if isinstance(payload, dict) else None
+    if isinstance(entries, list):
+        return [entry for entry in entries if isinstance(entry, dict)]
+    return []
+
+
+def _infer_manifest_entry(
+    path: Path,
+    common_meta: Dict[str, Any],
+    audio_hints: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    suffix = path.suffix.lower()
+    metadata = dict(common_meta)
+    content_type = "application/octet-stream"
+    if path.name.endswith("_metadata.json"):
+        metadata["file_role"] = "metadata"
+        content_type = "application/json"
+    elif path.name.endswith("_event.json"):
+        metadata["file_role"] = "event_source_metadata"
+        content_type = "application/json"
+    elif path.name.endswith("_provider_transcript.txt"):
+        metadata["file_role"] = "provider_transcript"
+        metadata["provider"] = "dialpad"
+        content_type = "text/plain"
+    elif path.name.endswith("_text.txt"):
+        metadata["file_role"] = "sms_text"
+        metadata["provider"] = "dialpad"
+        content_type = "text/plain"
+    elif path.name.endswith("_recording_references.json"):
+        metadata["file_role"] = "recording_references"
+        content_type = "application/json"
+    elif path.name.endswith("_manifest.json"):
+        metadata["file_role"] = "archive_manifest"
+        content_type = "application/json"
+    elif suffix in {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".webm"}:
+        metadata["file_role"] = "provider_audio"
+        metadata["provider"] = "dialpad"
+        if audio_hints:
+            metadata.update(audio_hints)
+        content_type = mimetypes.guess_type(str(path))[0] or "audio/mpeg"
+    else:
+        return None
+
+    return _manifest_entry(path, content_type, metadata, path.stat().st_size)
+
+
+def _rebuild_manifest_entries(archive_dir: Path, event_stem: str, common_meta: Dict[str, Any]) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    audio_hints: Dict[str, Any] = {}
+    for refs_path in sorted(archive_dir.glob("*_recording_references.json")):
+        payload = _load_json_file(refs_path) or {}
+        refs = payload.get("recording_references") or []
+        if not isinstance(refs, list):
+            continue
+        for ref in refs:
+            if not isinstance(ref, dict):
+                continue
+            metadata = ref.get("metadata") or {}
+            if not audio_hints.get("recording_id"):
+                audio_hints["recording_id"] = (
+                    metadata.get("recording_id")
+                    or metadata.get("voicemail_recording_id")
+                )
+            if not audio_hints.get("source_url") and _is_http_url(ref.get("storage_uri")):
+                audio_hints["source_url"] = ref.get("storage_uri")
+            if not audio_hints.get("recording_type"):
+                audio_hints["recording_type"] = metadata.get("recording_type") or (
+                    "voicemail" if "voicemail" in str(metadata.get("reference_type") or "") else None
+                )
+        if audio_hints:
+            break
+
+    for path in sorted(archive_dir.iterdir()):
+        if not path.is_file():
+            continue
+        if path == _manifest_path(archive_dir, event_stem):
+            continue
+        entry = _infer_manifest_entry(path, common_meta, audio_hints=audio_hints)
+        if entry is not None:
+            entries.append(entry)
+    return entries
+
+
+def _merge_manifest_entries(existing: List[Dict[str, Any]], current: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
+    for entry in existing + current:
+        storage_uri = str(entry.get("storage_uri") or "")
+        if not storage_uri:
+            continue
+        merged[storage_uri] = entry
+    return list(merged.values())
+
+
+def _find_existing_archive_dir(phone_channel_root: Path, event_uuid: str, external_id: str) -> Optional[Path]:
+    if not phone_channel_root.exists():
+        return None
+    for metadata_path in sorted(phone_channel_root.rglob("*_metadata.json")):
+        payload = _load_json_file(metadata_path)
+        if not payload:
+            continue
+        if payload.get("event_uuid") == event_uuid:
+            return metadata_path.parent
+        if external_id and payload.get("external_id") == external_id:
+            return metadata_path.parent
+    return None
+
+
+def _existing_event_stem(archive_dir: Path) -> Optional[str]:
+    for metadata_path in sorted(archive_dir.glob("*_metadata.json")):
+        payload = _load_json_file(metadata_path)
+        if not payload:
+            continue
+        event_stem = str(payload.get("event_stem") or "").strip()
+        if event_stem:
+            return event_stem
+    return archive_dir.name
 
 
 def _extract_http_urls(obj: Any) -> List[str]:
@@ -777,6 +910,26 @@ async def _download_audio_file(url: str) -> tuple[bytes, str, str]:
         return response.content, content_type, str(response.url)
 
 
+def _existing_audio_entry(
+    manifest_entries: List[Dict[str, Any]],
+    candidate: Dict[str, Any],
+    resolved_url: str,
+) -> Optional[Dict[str, Any]]:
+    candidate_recording_id = str(candidate.get("recording_id") or "").strip()
+    candidate_source = str(resolved_url or "").strip()
+    for entry in manifest_entries:
+        metadata = entry.get("metadata") or {}
+        if metadata.get("file_role") != "provider_audio":
+            continue
+        existing_recording_id = str(metadata.get("recording_id") or "").strip()
+        existing_source = str(metadata.get("source_url") or "").strip()
+        if candidate_recording_id and existing_recording_id == candidate_recording_id:
+            return entry
+        if candidate_source and existing_source == candidate_source:
+            return entry
+    return None
+
+
 async def _sync_archive_dir(archive_dir: Path) -> Optional[Dict[str, Any]]:
     if ARCHIVE_SYNC_MODE != "rsync" or not ARCHIVE_SYNC_RSYNC_DEST:
         return None
@@ -815,6 +968,7 @@ async def _download_recordings(
     archive_dir: Path,
     event_stem: str,
     common_meta: Dict[str, Any],
+    existing_manifest_entries: List[Dict[str, Any]],
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     manifests: List[Dict[str, Any]] = []
     results: List[Dict[str, Any]] = []
@@ -832,6 +986,20 @@ async def _download_recordings(
                         "recording_id": candidate.get("recording_id"),
                         "recording_type": candidate.get("recording_type"),
                         "source": candidate.get("source"),
+                    }
+                )
+                continue
+
+            existing_entry = _existing_audio_entry(existing_manifest_entries, candidate, resolved_url)
+            if existing_entry is not None:
+                results.append(
+                    {
+                        "index": index,
+                        "status": "already_present",
+                        "path": existing_entry.get("storage_uri"),
+                        "recording_id": candidate.get("recording_id"),
+                        "recording_type": candidate.get("recording_type"),
+                        "source_url": resolved_url,
                     }
                 )
                 continue
@@ -897,17 +1065,19 @@ async def handle_archive_export(job: Dict[str, Any]) -> Dict[str, Any]:
     source_provenance = payload.get("source_provenance") or {}
     company_slug = _company_slug(source_provenance)
     phone_bucket = _safe_component(_conversation_number(source_provenance), "unknown_number")
-    event_stem = _safe_component(
-        _event_stem(phone_bucket, channel, occurred_at, source_provenance),
-        "unknown_event",
+    external_id = str(payload.get("external_id") or "")
+    phone_channel_root = ARCHIVE_ROOT / phone_bucket / _channel_dir(channel)
+    existing_archive_dir = _find_existing_archive_dir(phone_channel_root, event_uuid, external_id)
+    event_stem = (
+        _existing_event_stem(existing_archive_dir)
+        if existing_archive_dir is not None
+        else _safe_component(
+            _event_stem(phone_bucket, channel, occurred_at, source_provenance),
+            "unknown_event",
+        )
     )
 
-    archive_dir = (
-        ARCHIVE_ROOT
-        / phone_bucket
-        / _channel_dir(channel)
-        / event_stem
-    )
+    archive_dir = existing_archive_dir or (phone_channel_root / event_stem)
     archive_dir.mkdir(parents=True, exist_ok=True)
 
     manifest: List[Dict[str, Any]] = []
@@ -918,6 +1088,9 @@ async def handle_archive_export(job: Dict[str, Any]) -> Dict[str, Any]:
         "event_stem": event_stem,
         "company_slug": company_slug,
     }
+    existing_manifest = _load_manifest_entries(archive_dir, event_stem)
+    if not existing_manifest:
+        existing_manifest = _rebuild_manifest_entries(archive_dir, event_stem, common_meta)
 
     metadata_payload = {
         "event_uuid": event_uuid,
@@ -1016,8 +1189,27 @@ async def handle_archive_export(job: Dict[str, Any]) -> Dict[str, Any]:
         archive_dir,
         event_stem,
         common_meta,
+        existing_manifest,
     )
     manifest.extend(audio_manifests)
+
+    merged_manifest = _merge_manifest_entries(existing_manifest, manifest)
+    manifest_path = _manifest_path(archive_dir, event_stem)
+    manifest_payload = {
+        "event_uuid": event_uuid,
+        "archive_files": merged_manifest,
+    }
+    manifest_size = _write_json(manifest_path, manifest_payload)
+    manifest_entry = _manifest_entry(
+        manifest_path,
+        "application/json",
+        {
+            **common_meta,
+            "file_role": "archive_manifest",
+        },
+        manifest_size,
+    )
+    final_manifest = _merge_manifest_entries(merged_manifest, [manifest_entry])
 
     sync_result = await _sync_archive_dir(archive_dir)
 
@@ -1025,7 +1217,7 @@ async def handle_archive_export(job: Dict[str, Any]) -> Dict[str, Any]:
         "job_uuid": job.get("job_uuid"),
         "event_uuid": event_uuid,
         "archive_dir": str(archive_dir),
-        "archive_files": manifest,
+        "archive_files": final_manifest,
         "provider_transcript_preserved": bool(provider_transcript_text),
         "sms_text_preserved": bool(sms_text),
         "recording_reference_count": len(recording_references or []),

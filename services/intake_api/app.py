@@ -476,6 +476,42 @@ def _archive_export_payload(
     }
 
 
+def _archive_payload_signature(archive_payload: Dict) -> str:
+    recording_refs = []
+    for ref in archive_payload.get("recording_references") or []:
+        metadata = ref.get("metadata") or {}
+        recording_refs.append(
+            {
+                "storage_uri": ref.get("storage_uri"),
+                "reference_type": metadata.get("reference_type"),
+                "recording_id": metadata.get("recording_id"),
+                "recording_type": metadata.get("recording_type"),
+                "voicemail_recording_id": metadata.get("voicemail_recording_id"),
+            }
+        )
+
+    source_metadata = archive_payload.get("source_metadata") or {}
+    signature_payload = {
+        "event_uuid": archive_payload.get("event_uuid"),
+        "channel": archive_payload.get("channel"),
+        "provider_transcript_text": archive_payload.get("provider_transcript_text") or None,
+        "sms_text": archive_payload.get("sms_text") or None,
+        "recording_references": sorted(
+            recording_refs,
+            key=lambda item: (
+                str(item.get("storage_uri") or ""),
+                str(item.get("reference_type") or ""),
+                str(item.get("recording_id") or ""),
+            ),
+        ),
+        "source_state": source_metadata.get("state"),
+        "voicemail_recording_id": source_metadata.get("voicemail_recording_id"),
+        "call_recording_ids": sorted(str(item) for item in (source_metadata.get("call_recording_ids") or [])),
+    }
+    rendered = json.dumps(signature_payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(rendered.encode("utf-8")).hexdigest()[:16]
+
+
 async def _insert_communication_event(evt: Dict, artifact: Dict) -> Dict:
     assert _pool is not None
 
@@ -938,9 +974,7 @@ async def _enqueue_processing_jobs(normalized: Dict) -> Dict[str, int]:
     jobs_to_queue: List[Tuple[str, Dict, str]] = []
     archive_payload = normalized.get("archive_payload")
     if archive_payload and channel in {"call", "voicemail", "sms"}:
-        archive_hash = hashlib.sha256(
-            json.dumps(archive_payload, sort_keys=True).encode("utf-8")
-        ).hexdigest()[:16]
+        archive_hash = _archive_payload_signature(archive_payload)
         jobs_to_queue.append(
             (
                 "ARCHIVE_EXPORT",
