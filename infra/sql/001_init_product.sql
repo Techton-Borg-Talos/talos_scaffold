@@ -81,6 +81,29 @@ CREATE TABLE IF NOT EXISTS event_artifacts (
 CREATE INDEX IF NOT EXISTS idx_artifacts_event ON event_artifacts (event_uuid);
 CREATE INDEX IF NOT EXISTS idx_artifacts_sha ON event_artifacts (sha256);
 
+CREATE TABLE IF NOT EXISTS event_participants (
+    participant_uuid   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_uuid         UUID NOT NULL REFERENCES communication_events(event_uuid) ON DELETE CASCADE,
+    participant_index  INTEGER NOT NULL,
+    role               TEXT NOT NULL,
+    display_name       TEXT,
+    email_raw          TEXT,
+    email_normalized   TEXT,
+    phone_raw          TEXT,
+    phone_normalized   TEXT,
+    source_person_id   TEXT,
+    source_system      source_system,
+    is_internal        BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (event_uuid, participant_index)
+);
+CREATE INDEX IF NOT EXISTS idx_event_participants_event
+    ON event_participants (event_uuid, participant_index);
+CREATE INDEX IF NOT EXISTS idx_event_participants_email
+    ON event_participants (email_normalized) WHERE email_normalized IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_event_participants_phone
+    ON event_participants (phone_normalized) WHERE phone_normalized IS NOT NULL;
+
 -- event_contact_links: surrogate PK + partial unique indexes.
 -- Postgres cannot use COALESCE-keyed uniqueness in a PRIMARY KEY.
 CREATE TABLE IF NOT EXISTS event_contact_links (

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import asyncpg
+import httpx
 import jwt
 from fastapi import FastAPI, HTTPException, Request
 
@@ -24,6 +25,7 @@ RAW.mkdir(parents=True, exist_ok=True)
 
 DIALPAD_SECRET = os.environ.get("DIALPAD_WEBHOOK_SECRET", "")
 DATABASE_URL = os.environ["DATABASE_URL"]
+CONTACT_ENGINE_URL = os.environ.get("CONTACT_ENGINE_URL", "http://contact_engine:8083")
 
 app = FastAPI(title="talos-intake", version="0.3.0")
 _pool: Optional[asyncpg.Pool] = None
@@ -432,7 +434,159 @@ async def _insert_communication_event(evt: Dict, artifact: Dict) -> Dict:
                 "channel": channel,
                 "external_id": external_id,
                 "participant_count": len(participants),
+                "participants": participants,
+                "remote_identifier": remote_identifier,
             }
+
+
+def _contact_identity_for_participant(participant: Dict) -> Optional[Tuple[str, str]]:
+    if participant.get("is_internal"):
+        return None
+
+    email = participant.get("email_normalized")
+    if email:
+        return ("email", email)
+
+    phone = participant.get("phone_normalized")
+    if phone:
+        return ("phone_e164", phone)
+
+    return None
+
+
+async def _resolve_contacts_for_event(normalized: Dict) -> Dict[str, int]:
+    assert _pool is not None
+
+    event_uuid = normalized["event_uuid"]
+    participants = normalized.get("participants", [])
+    remote_identifier = normalized.get("remote_identifier")
+
+    linked_contacts = 0
+    linked_candidates = 0
+    resolved_primary_contact: Optional[str] = None
+    resolved_contact_ids: set[str] = set()
+
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        async with _pool.acquire() as conn:
+            async with conn.transaction():
+                for participant in participants:
+                    identity = _contact_identity_for_participant(participant)
+                    if identity is None:
+                        continue
+
+                    identity_kind, identity_value = identity
+                    try:
+                        response = await client.post(
+                            f"{CONTACT_ENGINE_URL.rstrip('/')}/resolve_or_track",
+                            json={
+                                "identity_kind": identity_kind,
+                                "identity_value": identity_value,
+                                "event_uuid": event_uuid,
+                                "source_system": "dialpad",
+                            },
+                        )
+                        response.raise_for_status()
+                    except Exception:
+                        LOG.exception(
+                            "contact resolution failed: event_uuid=%s role=%s identity=%s",
+                            event_uuid,
+                            participant.get("role"),
+                            identity_value,
+                        )
+                        continue
+
+                    payload = response.json()
+                    role = str(participant["role"])
+                    contact_uuid = payload.get("contact_uuid")
+                    candidate_uuid = payload.get("candidate_uuid")
+
+                    if contact_uuid:
+                        resolved_contact_ids.add(contact_uuid)
+                        await conn.execute(
+                            """
+                            INSERT INTO event_contact_links
+                            (
+                                event_uuid,
+                                contact_uuid,
+                                role,
+                                confidence,
+                                resolver
+                            )
+                            VALUES
+                            (
+                                $1,
+                                $2,
+                                $3,
+                                $4,
+                                $5
+                            )
+                            ON CONFLICT (event_uuid, role, contact_uuid)
+                            WHERE contact_uuid IS NOT NULL
+                            DO UPDATE SET
+                                confidence = EXCLUDED.confidence,
+                                resolver = EXCLUDED.resolver
+                            """,
+                            event_uuid,
+                            contact_uuid,
+                            role,
+                            1.0,
+                            "contact_engine",
+                        )
+                        linked_contacts += 1
+                        if identity_value == remote_identifier:
+                            resolved_primary_contact = contact_uuid
+
+                    elif candidate_uuid:
+                        await conn.execute(
+                            """
+                            INSERT INTO event_contact_links
+                            (
+                                event_uuid,
+                                candidate_uuid,
+                                role,
+                                confidence,
+                                resolver
+                            )
+                            VALUES
+                            (
+                                $1,
+                                $2,
+                                $3,
+                                $4,
+                                $5
+                            )
+                            ON CONFLICT (event_uuid, role, candidate_uuid)
+                            WHERE candidate_uuid IS NOT NULL
+                            DO UPDATE SET
+                                confidence = EXCLUDED.confidence,
+                                resolver = EXCLUDED.resolver
+                            """,
+                            event_uuid,
+                            candidate_uuid,
+                            role,
+                            1.0,
+                            "contact_engine",
+                        )
+                        linked_candidates += 1
+
+                if resolved_primary_contact is None and len(resolved_contact_ids) == 1:
+                    resolved_primary_contact = next(iter(resolved_contact_ids))
+
+                if resolved_primary_contact is not None:
+                    await conn.execute(
+                        """
+                        UPDATE communication_events
+                        SET contact_uuid = $2
+                        WHERE event_uuid = $1
+                        """,
+                        event_uuid,
+                        resolved_primary_contact,
+                    )
+
+    return {
+        "linked_contacts": linked_contacts,
+        "linked_candidates": linked_candidates,
+    }
 
 
 @app.post("/webhooks/dialpad")
@@ -443,14 +597,17 @@ async def dialpad(request: Request):
     evt = _decode_dialpad_event(raw)
     artifact = _archive("dialpad", raw, content_type)
     normalized = await _insert_communication_event(evt, artifact)
+    resolution = await _resolve_contacts_for_event(normalized)
 
     LOG.info(
-        "dialpad accepted: artifact=%s event_uuid=%s channel=%s external_id=%s participants=%s",
+        "dialpad accepted: artifact=%s event_uuid=%s channel=%s external_id=%s participants=%s contacts=%s candidates=%s",
         artifact["artifact_uuid"],
         normalized["event_uuid"],
         normalized["channel"],
         normalized["external_id"],
         normalized["participant_count"],
+        resolution["linked_contacts"],
+        resolution["linked_candidates"],
     )
 
     return {
@@ -459,6 +616,8 @@ async def dialpad(request: Request):
         "event_uuid": normalized["event_uuid"],
         "channel": normalized["channel"],
         "participant_count": normalized["participant_count"],
+        "linked_contacts": resolution["linked_contacts"],
+        "linked_candidates": resolution["linked_candidates"],
     }
 
 

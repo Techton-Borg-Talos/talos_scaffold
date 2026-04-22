@@ -55,6 +55,7 @@ services:
     environment:
       DATABASE_URL: postgresql://${PRODUCT_DB_USER:-talos_product}:${PRODUCT_DB_PASSWORD}@postgres_product:5432/${PRODUCT_DB_NAME:-talos_product}
       RAW_ARTIFACT_DIR: /var/lib/talos/raw
+      CONTACT_ENGINE_URL: ${CONTACT_ENGINE_URL:-http://contact_engine:8083}
       DIALPAD_WEBHOOK_SECRET: ${DIALPAD_WEBHOOK_SECRET}
       GMAIL_OAUTH_CLIENT_ID: ${GMAIL_OAUTH_CLIENT_ID}
       GMAIL_OAUTH_CLIENT_SECRET: ${GMAIL_OAUTH_CLIENT_SECRET}
@@ -62,6 +63,7 @@ services:
     volumes:
       - raw_artifacts:/var/lib/talos/raw
     depends_on:
+      - contact_engine
       - postgres_product
     networks: [product_net]
 
