@@ -141,10 +141,17 @@ async def _tick():
             return
         async with httpx.AsyncClient(timeout=10.0) as c:
             for j in jobs:
+                payload = j["payload"]
+                if isinstance(payload, str):
+                    try:
+                        payload = json.loads(payload)
+                    except json.JSONDecodeError:
+                        LOG.warning("invalid json payload for job %s", j["job_uuid"])
+                        payload = {}
                 body = {"job_uuid":str(j["job_uuid"]),"job_type":j["job_type"],
                         "contact_uuid":str(j["contact_uuid"]) if j["contact_uuid"] else None,
                         "event_uuid":str(j["event_uuid"]) if j["event_uuid"] else None,
-                        "payload":j["payload"]}
+                        "payload":payload}
                 h = {"Authorization":f"Bearer {LOCAL_WORKER_TOKEN}"} if LOCAL_WORKER_TOKEN else {}
                 try:
                     r = await c.post(f"{LOCAL_WORKER_URL.rstrip('/')}/dispatch", json=body, headers=h)
@@ -152,6 +159,9 @@ async def _tick():
                         await conn.execute(
                             "UPDATE processing_jobs SET state='DISPATCHED', dispatched_at=now() WHERE job_uuid=$1",
                             j["job_uuid"])
+                    else:
+                        LOG.warning("dispatch rejected %s: status=%s body=%s",
+                                    j["job_uuid"], r.status_code, r.text)
                 except Exception as e:
                     LOG.warning("dispatch failed %s: %s", j["job_uuid"], e)
 
