@@ -589,6 +589,57 @@ async def _resolve_contacts_for_event(normalized: Dict) -> Dict[str, int]:
     }
 
 
+async def _enqueue_processing_jobs(normalized: Dict) -> Dict[str, int]:
+    assert _pool is not None
+
+    event_uuid = normalized["event_uuid"]
+    channel = normalized["channel"]
+    enqueued_jobs = 0
+
+    jobs_to_queue: List[Tuple[str, Dict]] = []
+    if channel in {"call", "voicemail"}:
+        jobs_to_queue.append(("TRANSCRIBE", {"channel": channel}))
+
+    if not jobs_to_queue:
+        return {"enqueued_jobs": 0}
+
+    async with _pool.acquire() as conn:
+        async with conn.transaction():
+            for job_type, payload in jobs_to_queue:
+                idempotency_key = f"{job_type.lower()}:{event_uuid}"
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO processing_jobs
+                    (
+                        job_type,
+                        state,
+                        event_uuid,
+                        payload,
+                        idempotency_key
+                    )
+                    VALUES
+                    (
+                        $1,
+                        'QUEUED'::job_state,
+                        $2,
+                        $3::jsonb,
+                        $4
+                    )
+                    ON CONFLICT (idempotency_key)
+                    DO NOTHING
+                    RETURNING job_uuid
+                    """,
+                    job_type,
+                    event_uuid,
+                    json.dumps(payload),
+                    idempotency_key,
+                )
+                if row is not None:
+                    enqueued_jobs += 1
+
+    return {"enqueued_jobs": enqueued_jobs}
+
+
 @app.post("/webhooks/dialpad")
 async def dialpad(request: Request):
     raw = await request.body()
@@ -598,9 +649,10 @@ async def dialpad(request: Request):
     artifact = _archive("dialpad", raw, content_type)
     normalized = await _insert_communication_event(evt, artifact)
     resolution = await _resolve_contacts_for_event(normalized)
+    jobs = await _enqueue_processing_jobs(normalized)
 
     LOG.info(
-        "dialpad accepted: artifact=%s event_uuid=%s channel=%s external_id=%s participants=%s contacts=%s candidates=%s",
+        "dialpad accepted: artifact=%s event_uuid=%s channel=%s external_id=%s participants=%s contacts=%s candidates=%s jobs=%s",
         artifact["artifact_uuid"],
         normalized["event_uuid"],
         normalized["channel"],
@@ -608,6 +660,7 @@ async def dialpad(request: Request):
         normalized["participant_count"],
         resolution["linked_contacts"],
         resolution["linked_candidates"],
+        jobs["enqueued_jobs"],
     )
 
     return {
@@ -618,6 +671,7 @@ async def dialpad(request: Request):
         "participant_count": normalized["participant_count"],
         "linked_contacts": resolution["linked_contacts"],
         "linked_candidates": resolution["linked_candidates"],
+        "enqueued_jobs": jobs["enqueued_jobs"],
     }
 
 
