@@ -10,12 +10,13 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 
 import asyncpg
 import httpx
 import jwt
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request
+from pydantic import BaseModel
 
 LOG = logging.getLogger("talos.intake")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -26,6 +27,7 @@ RAW.mkdir(parents=True, exist_ok=True)
 DIALPAD_SECRET = os.environ.get("DIALPAD_WEBHOOK_SECRET", "")
 DATABASE_URL = os.environ["DATABASE_URL"]
 CONTACT_ENGINE_URL = os.environ.get("CONTACT_ENGINE_URL", "http://contact_engine:8083")
+WORKER_WRITEBACK_TOKEN = os.environ.get("WORKER_WRITEBACK_TOKEN", "")
 
 app = FastAPI(title="talos-intake", version="0.3.0")
 _pool: Optional[asyncpg.Pool] = None
@@ -47,6 +49,23 @@ async def shutdown() -> None:
 @app.get("/healthz")
 async def healthz():
     return {"ok": True, "service": "intake_api"}
+
+
+class WorkerJobUpdate(BaseModel):
+    job_uuid: str
+    state: Literal["PROCESSING", "SUCCEEDED", "FAILED"]
+    result: Dict = {}
+    error: Optional[str] = None
+    worker_id: Optional[str] = None
+
+
+def _require_worker_writeback_token(authorization: Optional[str]) -> None:
+    if not WORKER_WRITEBACK_TOKEN:
+        raise HTTPException(503, "worker writeback token not configured")
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "missing bearer token")
+    if authorization[len("Bearer ") :].strip() != WORKER_WRITEBACK_TOKEN:
+        raise HTTPException(401, "bad token")
 
 
 def _archive(source: str, raw: bytes, content_type: str) -> Dict:
@@ -681,6 +700,59 @@ async def dialpad_debug(request: Request):
     LOG.warning("DIALPAD DEBUG headers=%s", dict(request.headers))
     LOG.warning("DIALPAD DEBUG body[:500]=%r", raw[:500])
     return {"ok": True}
+
+
+@app.post("/internal/worker/jobs/update")
+async def worker_job_update(
+    req: WorkerJobUpdate,
+    authorization: Optional[str] = Header(default=None),
+):
+    _require_worker_writeback_token(authorization)
+    assert _pool is not None
+
+    result_payload = dict(req.result or {})
+    if req.error:
+        result_payload["error"] = req.error
+    if req.worker_id:
+        result_payload["worker_id"] = req.worker_id
+
+    async with _pool.acquire() as conn:
+        async with conn.transaction():
+            if req.state == "PROCESSING":
+                row = await conn.fetchrow(
+                    """
+                    UPDATE processing_jobs
+                    SET
+                        state = 'PROCESSING'::job_state,
+                        started_at = COALESCE(started_at, now()),
+                        result = COALESCE(result, '{}'::jsonb) || $2::jsonb
+                    WHERE job_uuid = $1
+                    RETURNING job_uuid
+                    """,
+                    req.job_uuid,
+                    json.dumps(result_payload),
+                )
+            else:
+                row = await conn.fetchrow(
+                    """
+                    UPDATE processing_jobs
+                    SET
+                        state = $2::job_state,
+                        started_at = COALESCE(started_at, now()),
+                        finished_at = now(),
+                        result = $3::jsonb
+                    WHERE job_uuid = $1
+                    RETURNING job_uuid
+                    """,
+                    req.job_uuid,
+                    req.state,
+                    json.dumps(result_payload),
+                )
+
+    if row is None:
+        raise HTTPException(404, "job not found")
+
+    return {"ok": True, "job_uuid": req.job_uuid, "state": req.state}
 
 
 @app.post("/ingest/gmail")

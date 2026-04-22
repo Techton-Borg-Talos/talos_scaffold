@@ -3,11 +3,15 @@ from __future__ import annotations
 import logging, os
 from typing import Any, Awaitable, Callable, Dict, Optional
 from fastapi import FastAPI, Header, HTTPException
+import httpx
 from pydantic import BaseModel
 
 LOG = logging.getLogger("talos.worker")
 logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"))
 LOCAL_WORKER_TOKEN = os.environ.get("LOCAL_WORKER_TOKEN","")
+PRODUCT_WRITEBACK_URL = os.environ.get("PRODUCT_WRITEBACK_URL","").strip()
+PRODUCT_WRITEBACK_TOKEN = os.environ.get("PRODUCT_WRITEBACK_TOKEN","").strip()
+WORKER_ID = os.environ.get("WORKER_ID", os.environ.get("HOSTNAME", "talos_worker"))
 ENABLED_MODULES = {m.strip() for m in os.environ.get("ENABLED_MODULES","").split(",") if m.strip()}
 app = FastAPI(title="talos-worker", version="0.1.0")
 
@@ -22,19 +26,57 @@ def register(job_type: str, module_name: str):
         return fn
     return _wrap
 
+async def _writeback(job_uuid: str, state: str, result: Optional[Dict[str, Any]] = None,
+                     error: Optional[str] = None) -> None:
+    if not PRODUCT_WRITEBACK_URL:
+        return
+    headers = {}
+    if PRODUCT_WRITEBACK_TOKEN:
+        headers["Authorization"] = f"Bearer {PRODUCT_WRITEBACK_TOKEN}"
+    body = {
+        "job_uuid": job_uuid,
+        "state": state,
+        "result": result or {},
+        "error": error,
+        "worker_id": WORKER_ID,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.post(PRODUCT_WRITEBACK_URL, json=body, headers=headers)
+            if not (200 <= r.status_code < 300):
+                LOG.warning("writeback rejected %s: status=%s body=%s", job_uuid, r.status_code, r.text)
+    except Exception as e:
+        LOG.warning("writeback failed %s: %s", job_uuid, e)
+
 async def _dispatch(job: Dict[str, Any]) -> Dict[str, Any]:
     jt = job.get("job_type","")
+    job_uuid = str(job.get("job_uuid") or "")
     p = _handlers.get(jt)
-    if p is None: return {"status":"unhandled","job_type":jt}
+    if p is None:
+        result = {"status":"unhandled","job_type":jt}
+        if job_uuid:
+            await _writeback(job_uuid, "FAILED", result=result, error="unhandled job type")
+        return result
     mn, fn = p
     if mn not in ENABLED_MODULES:
-        return {"status":"skipped","reason":"module_disabled","module":mn}
+        result = {"status":"skipped","reason":"module_disabled","module":mn}
+        if job_uuid:
+            await _writeback(job_uuid, "FAILED", result=result, error="module disabled")
+        return result
+    if job_uuid:
+        await _writeback(job_uuid, "PROCESSING", result={"job_type": jt, "module": mn})
     try:
         r = await fn(job)
-        return {"status":"ok","module":mn,"result":r}
+        result = {"status":"ok","module":mn,"result":r}
+        if job_uuid:
+            await _writeback(job_uuid, "SUCCEEDED", result=result)
+        return result
     except Exception as e:
         LOG.exception("handler failed for %s", jt)
-        return {"status":"error","module":mn,"error":str(e)}
+        result = {"status":"error","module":mn,"error":str(e)}
+        if job_uuid:
+            await _writeback(job_uuid, "FAILED", result=result, error=str(e))
+        return result
 
 def _require_token(auth: Optional[str]) -> None:
     if not LOCAL_WORKER_TOKEN: return

@@ -15,6 +15,8 @@ services:
     environment:
       PRODUCT_DATABASE_URL: ${PRODUCT_DATABASE_URL}
       LOCAL_WORKER_TOKEN: ${LOCAL_WORKER_TOKEN}
+      PRODUCT_WRITEBACK_URL: ${PRODUCT_WRITEBACK_URL}
+      PRODUCT_WRITEBACK_TOKEN: ${PRODUCT_WRITEBACK_TOKEN}
       ARTIFACT_ARCHIVE_DIR: /mnt/archive
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       ENABLED_MODULES: ${ENABLED_MODULES:-transcription,behavior_analysis,contact_engine_local,baseline_updates,deferred_backfill}
