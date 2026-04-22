@@ -290,6 +290,129 @@ def _dialpad_participants(evt: Dict, channel: str) -> List[Dict]:
     return participants
 
 
+def _source_provenance(evt: Dict, channel: str) -> Dict:
+    target = evt.get("target") or {}
+    contact = evt.get("contact") or {}
+    return {
+        "source_system": "dialpad",
+        "channel": channel,
+        "direction": _direction(evt),
+        "external_id": str(evt.get("call_id") or evt.get("id") or ""),
+        "call_id": str(evt.get("call_id")) if evt.get("call_id") is not None else None,
+        "target": {
+            "id": str(target.get("id")) if target.get("id") is not None else None,
+            "name": target.get("name"),
+            "type": target.get("type"),
+            "email": _normalize_email(target.get("email")),
+            "phone": _normalize_phone(target.get("phone")),
+            "office_id": str(target.get("office_id")) if target.get("office_id") is not None else None,
+        },
+        "contact": {
+            "id": str(contact.get("id")) if contact.get("id") is not None else None,
+            "name": contact.get("name"),
+            "type": contact.get("type"),
+            "email": _normalize_email(contact.get("email")),
+            "phone": _normalize_phone(contact.get("phone")),
+        },
+        "internal_number": _normalize_phone(evt.get("internal_number")),
+        "external_number": _normalize_phone(evt.get("external_number")),
+        "from_number": _normalize_phone(evt.get("from_number")),
+        "selected_caller_id": _normalize_phone(evt.get("selected_caller_id")),
+    }
+
+
+def _enriched_source_metadata(evt: Dict, channel: str) -> Dict:
+    payload = dict(evt)
+    payload["_talos"] = {
+        "source_provenance": _source_provenance(evt, channel),
+    }
+    return payload
+
+
+def _provider_transcript_payload(evt: Dict, channel: str, event_uuid: str) -> Optional[Dict]:
+    text = (evt.get("transcription_text") or "").strip()
+    if not text:
+        return None
+    provenance = _source_provenance(evt, channel)
+    return {
+        "event_uuid": event_uuid,
+        "engine": "dialpad_provider",
+        "language": evt.get("language"),
+        "diarized": False,
+        "text": text,
+        "confidence": None,
+        "metadata": {
+            "provider": "dialpad",
+            "provider_state": evt.get("state"),
+            "voicemail_link": evt.get("voicemail_link"),
+            "voicemail_recording_id": evt.get("voicemail_recording_id"),
+            "call_recording_ids": evt.get("call_recording_ids") or [],
+            "recording_details": evt.get("recording_details") or [],
+            "source_provenance": provenance,
+        },
+    }
+
+
+def _provider_recording_artifacts(evt: Dict, channel: str, event_uuid: str) -> List[Dict]:
+    provenance = _source_provenance(evt, channel)
+    refs: List[Dict] = []
+
+    voicemail_link = evt.get("voicemail_link")
+    if voicemail_link:
+        refs.append(
+            {
+                "event_uuid": event_uuid,
+                "kind": "provider_recording_reference",
+                "storage_scheme": "dialpad",
+                "storage_uri": str(voicemail_link),
+                "content_type": "text/uri-list",
+                "metadata": {
+                    "provider": "dialpad",
+                    "reference_type": "voicemail_link",
+                    "voicemail_recording_id": evt.get("voicemail_recording_id"),
+                    "source_provenance": provenance,
+                },
+            }
+        )
+
+    voicemail_recording_id = evt.get("voicemail_recording_id")
+    if voicemail_recording_id:
+        refs.append(
+            {
+                "event_uuid": event_uuid,
+                "kind": "provider_recording_reference",
+                "storage_scheme": "dialpad",
+                "storage_uri": f"dialpad://voicemail_recording/{voicemail_recording_id}",
+                "content_type": "application/x.dialpad.recording-reference",
+                "metadata": {
+                    "provider": "dialpad",
+                    "reference_type": "voicemail_recording_id",
+                    "recording_id": voicemail_recording_id,
+                    "source_provenance": provenance,
+                },
+            }
+        )
+
+    for recording_id in evt.get("call_recording_ids") or []:
+        refs.append(
+            {
+                "event_uuid": event_uuid,
+                "kind": "provider_recording_reference",
+                "storage_scheme": "dialpad",
+                "storage_uri": f"dialpad://call_recording/{recording_id}",
+                "content_type": "application/x.dialpad.recording-reference",
+                "metadata": {
+                    "provider": "dialpad",
+                    "reference_type": "call_recording_id",
+                    "recording_id": recording_id,
+                    "source_provenance": provenance,
+                },
+            }
+        )
+
+    return refs
+
+
 async def _insert_communication_event(evt: Dict, artifact: Dict) -> Dict:
     assert _pool is not None
 
@@ -305,6 +428,7 @@ async def _insert_communication_event(evt: Dict, artifact: Dict) -> Dict:
     remote_identifier, local_identifier = _event_identity_fields(evt, channel)
     subject = _subject(evt, channel)
     participants = _dialpad_participants(evt, channel)
+    enriched_source_metadata = _enriched_source_metadata(evt, channel)
 
     async with _pool.acquire() as conn:
         async with conn.transaction():
@@ -356,10 +480,13 @@ async def _insert_communication_event(evt: Dict, artifact: Dict) -> Dict:
                 local_identifier,
                 occurred_at,
                 subject,
-                json.dumps(evt),
+                json.dumps(enriched_source_metadata),
             )
 
             event_uuid = row["event_uuid"]
+            event_uuid_str = str(event_uuid)
+            provider_transcript = _provider_transcript_payload(evt, channel, event_uuid_str)
+            provider_recording_artifacts = _provider_recording_artifacts(evt, channel, event_uuid_str)
 
             await conn.execute(
                 """
@@ -448,6 +575,122 @@ async def _insert_communication_event(evt: Dict, artifact: Dict) -> Dict:
                 json.dumps({"artifact_uuid": artifact["artifact_uuid"]}),
             )
 
+            await conn.execute(
+                """
+                DELETE FROM transcripts
+                WHERE event_uuid = $1 AND engine = 'dialpad_provider'
+                """,
+                event_uuid,
+            )
+
+            await conn.execute(
+                """
+                DELETE FROM event_artifacts
+                WHERE event_uuid = $1 AND kind = 'provider_recording_reference'
+                """,
+                event_uuid,
+            )
+
+            if provider_transcript is not None:
+                transcript_row = await conn.fetchrow(
+                    """
+                    INSERT INTO transcripts
+                    (
+                        event_uuid,
+                        engine,
+                        language,
+                        diarized,
+                        text,
+                        confidence,
+                        metadata
+                    )
+                    VALUES
+                    (
+                        $1,
+                        $2,
+                        $3,
+                        $4,
+                        $5,
+                        $6,
+                        $7::jsonb
+                    )
+                    RETURNING transcript_uuid
+                    """,
+                    event_uuid,
+                    provider_transcript["engine"],
+                    provider_transcript["language"],
+                    provider_transcript["diarized"],
+                    provider_transcript["text"],
+                    provider_transcript["confidence"],
+                    json.dumps(provider_transcript["metadata"]),
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO utterances
+                    (
+                        transcript_uuid,
+                        sequence,
+                        speaker_label,
+                        text,
+                        confidence,
+                        metadata
+                    )
+                    VALUES
+                    (
+                        $1,
+                        1,
+                        $2,
+                        $3,
+                        $4,
+                        $5::jsonb
+                    )
+                    """,
+                    transcript_row["transcript_uuid"],
+                    "provider_unknown",
+                    provider_transcript["text"],
+                    provider_transcript["confidence"],
+                    json.dumps(
+                        {
+                            "provider": "dialpad",
+                            "source_provenance": provider_transcript["metadata"]["source_provenance"],
+                        }
+                    ),
+                )
+
+            for ref in provider_recording_artifacts:
+                await conn.execute(
+                    """
+                    INSERT INTO event_artifacts
+                    (
+                        event_uuid,
+                        kind,
+                        storage_scheme,
+                        storage_uri,
+                        sha256,
+                        byte_size,
+                        content_type,
+                        metadata
+                    )
+                    VALUES
+                    (
+                        $1,
+                        $2,
+                        $3,
+                        $4,
+                        NULL,
+                        NULL,
+                        $5,
+                        $6::jsonb
+                    )
+                    """,
+                    event_uuid,
+                    ref["kind"],
+                    ref["storage_scheme"],
+                    ref["storage_uri"],
+                    ref["content_type"],
+                    json.dumps(ref["metadata"]),
+                )
+
             return {
                 "event_uuid": str(event_uuid),
                 "channel": channel,
@@ -455,6 +698,8 @@ async def _insert_communication_event(evt: Dict, artifact: Dict) -> Dict:
                 "participant_count": len(participants),
                 "participants": participants,
                 "remote_identifier": remote_identifier,
+                "provider_transcript_preserved": provider_transcript is not None,
+                "provider_recording_ref_count": len(provider_recording_artifacts),
             }
 
 
@@ -671,7 +916,7 @@ async def dialpad(request: Request):
     jobs = await _enqueue_processing_jobs(normalized)
 
     LOG.info(
-        "dialpad accepted: artifact=%s event_uuid=%s channel=%s external_id=%s participants=%s contacts=%s candidates=%s jobs=%s",
+        "dialpad accepted: artifact=%s event_uuid=%s channel=%s external_id=%s participants=%s contacts=%s candidates=%s jobs=%s provider_transcript=%s recording_refs=%s",
         artifact["artifact_uuid"],
         normalized["event_uuid"],
         normalized["channel"],
@@ -680,6 +925,8 @@ async def dialpad(request: Request):
         resolution["linked_contacts"],
         resolution["linked_candidates"],
         jobs["enqueued_jobs"],
+        normalized["provider_transcript_preserved"],
+        normalized["provider_recording_ref_count"],
     )
 
     return {
@@ -691,6 +938,8 @@ async def dialpad(request: Request):
         "linked_contacts": resolution["linked_contacts"],
         "linked_candidates": resolution["linked_candidates"],
         "enqueued_jobs": jobs["enqueued_jobs"],
+        "provider_transcript_preserved": normalized["provider_transcript_preserved"],
+        "provider_recording_ref_count": normalized["provider_recording_ref_count"],
     }
 
 
