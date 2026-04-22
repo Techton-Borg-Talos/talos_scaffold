@@ -157,7 +157,9 @@ async def _tick():
                     r = await c.post(f"{LOCAL_WORKER_URL.rstrip('/')}/dispatch", json=body, headers=h)
                     if 200<=r.status_code<300:
                         await conn.execute(
-                            "UPDATE processing_jobs SET state='DISPATCHED', dispatched_at=now() WHERE job_uuid=$1",
+                            "UPDATE processing_jobs "
+                            "SET state='DISPATCHED', dispatched_at=COALESCE(dispatched_at, now()) "
+                            "WHERE job_uuid=$1 AND state='QUEUED'",
                             j["job_uuid"])
                     else:
                         LOG.warning("dispatch rejected %s: status=%s body=%s",
