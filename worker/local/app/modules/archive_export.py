@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import json
 import mimetypes
 import os
@@ -10,6 +12,7 @@ import shlex
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -53,8 +56,20 @@ ARCHIVE_SYNC_MODE = os.environ.get("ARCHIVE_SYNC_MODE", "none").strip().lower()
 ARCHIVE_SYNC_RSYNC_DEST = os.environ.get("ARCHIVE_SYNC_RSYNC_DEST", "").strip()
 ARCHIVE_SYNC_SSH_KEY_PATH = os.environ.get("ARCHIVE_SYNC_SSH_KEY_PATH", "").strip()
 ARCHIVE_SYNC_SSH_OPTS = os.environ.get("ARCHIVE_SYNC_SSH_OPTS", "").strip()
-DIALPAD_API_TOKEN = os.environ.get("DIALPAD_API_TOKEN", "").strip()
+DIALPAD_CLIENT_ID = os.environ.get("DIALPAD_CLIENT_ID", "").strip()
+DIALPAD_CLIENT_SECRET = os.environ.get("DIALPAD_CLIENT_SECRET", "").strip()
+DIALPAD_REFRESH_TOKEN = os.environ.get("DIALPAD_REFRESH_TOKEN", "").strip()
+DIALPAD_ACCESS_TOKEN = os.environ.get("DIALPAD_ACCESS_TOKEN", "").strip()
 DIALPAD_RECORDING_SHARE_PRIVACY = os.environ.get("DIALPAD_RECORDING_SHARE_PRIVACY", "company").strip() or "company"
+DIALPAD_STATS_POLL_WAIT = max(0, int(os.environ.get("DIALPAD_POLL_WAIT", "5") or "5"))
+DIALPAD_STATS_POLL_MAX = max(1, int(os.environ.get("DIALPAD_POLL_MAX", "8") or "8"))
+DIALPAD_STATS_POLL_RETRY = max(1, int(os.environ.get("DIALPAD_POLL_RETRY", "5") or "5"))
+DIALPAD_API_BASE = "https://dialpad.com/api/v2"
+DIALPAD_TOKEN_URL = "https://dialpad.com/oauth2/token"
+DIALPAD_COMPANY_ID = os.environ.get("DIALPAD_COMPANY_ID", "").strip()
+_dialpad_token_lock = asyncio.Lock()
+_dialpad_access_token = DIALPAD_ACCESS_TOKEN
+_dialpad_refresh_token = DIALPAD_REFRESH_TOKEN
 
 
 def _safe_component(value: Optional[str], fallback: str) -> str:
@@ -225,31 +240,382 @@ def _extract_http_urls(obj: Any) -> List[str]:
     return urls
 
 
-def _recording_candidates(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    candidates: List[Dict[str, Any]] = []
-    seen: set[tuple[str, str, str]] = set()
-    source_metadata = payload.get("source_metadata") or {}
-    recording_references = payload.get("recording_references") or []
+def _is_http_url(value: Any) -> bool:
+    text = str(value or "").strip()
+    return text.startswith("http://") or text.startswith("https://")
 
-    for detail in source_metadata.get("recording_details") or []:
-        if not isinstance(detail, dict):
-            continue
-        candidate = {
-            "url": detail.get("url"),
-            "recording_id": detail.get("id"),
-            "recording_type": detail.get("recording_type"),
-            "duration_ms": detail.get("duration"),
-            "start_time": detail.get("start_time"),
-            "source": "recording_details",
-        }
+
+def _is_dialpad_url(value: str) -> bool:
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"} and parsed.netloc.endswith("dialpad.com")
+
+
+async def _refresh_dialpad_access_token() -> Optional[str]:
+    global _dialpad_access_token, _dialpad_refresh_token
+
+    if not (DIALPAD_CLIENT_ID and DIALPAD_CLIENT_SECRET and _dialpad_refresh_token):
+        return None
+
+    async with _dialpad_token_lock:
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            response = await client.post(
+                DIALPAD_TOKEN_URL,
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": _dialpad_refresh_token,
+                    "client_id": DIALPAD_CLIENT_ID,
+                    "client_secret": DIALPAD_CLIENT_SECRET,
+                },
+                headers={"Accept": "application/json"},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            access_token = str(payload.get("access_token") or "").strip()
+            if not access_token:
+                return None
+            _dialpad_access_token = access_token
+            refreshed = str(payload.get("refresh_token") or "").strip()
+            if refreshed:
+                _dialpad_refresh_token = refreshed
+            return _dialpad_access_token
+
+
+async def _dialpad_bearer(force_refresh: bool = False) -> str:
+    global _dialpad_access_token
+
+    if force_refresh:
+        refreshed = await _refresh_dialpad_access_token()
+        return refreshed or _dialpad_access_token
+
+    if _dialpad_access_token:
+        return _dialpad_access_token
+
+    refreshed = await _refresh_dialpad_access_token()
+    return refreshed or ""
+
+
+async def _dialpad_headers(force_refresh: bool = False) -> Dict[str, str]:
+    headers = {
+        "Accept": "application/json",
+    }
+    token = await _dialpad_bearer(force_refresh=force_refresh)
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+async def _dialpad_request(
+    method: str,
+    url: str,
+    *,
+    client: Optional[httpx.AsyncClient] = None,
+    retry_on_401: bool = True,
+    **kwargs: Any,
+) -> httpx.Response:
+    async def _once(force_refresh: bool) -> httpx.Response:
+        local_client = client
+        close_client = False
+        if local_client is None:
+            local_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+            close_client = True
+        try:
+            request_kwargs = dict(kwargs)
+            headers = dict(request_kwargs.pop("headers", {}))
+            headers.update(await _dialpad_headers(force_refresh=force_refresh))
+            response = await local_client.request(method, url, headers=headers, **request_kwargs)
+            return response
+        finally:
+            if close_client:
+                await local_client.aclose()
+
+    first = await _once(False)
+    if first.status_code != 401 or not retry_on_401:
+        return first
+    second = await _once(True)
+    return second
+
+
+def _dedupe_candidates(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for candidate in candidates:
         key = (
             str(candidate.get("url") or ""),
             str(candidate.get("recording_id") or ""),
             str(candidate.get("recording_type") or ""),
+            str(candidate.get("source") or ""),
         )
-        if key not in seen:
-            seen.add(key)
-            candidates.append(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+    return deduped
+
+
+def _call_id_for_payload(payload: Dict[str, Any]) -> str:
+    source_metadata = payload.get("source_metadata") or {}
+    source_provenance = payload.get("source_provenance") or {}
+    return str(
+        source_metadata.get("call_id")
+        or source_provenance.get("call_id")
+        or payload.get("external_id")
+        or ""
+    ).strip()
+
+
+def _stats_target_candidates(payload: Dict[str, Any]) -> List[tuple[str, str]]:
+    source_provenance = payload.get("source_provenance") or {}
+    target = source_provenance.get("target") or {}
+    candidates: List[tuple[str, str]] = []
+    office_id = str(target.get("office_id") or "").strip()
+    target_type = str(target.get("type") or "").strip().lower()
+    target_id = str(target.get("id") or "").strip()
+    if office_id:
+        candidates.append(("office", office_id))
+    if target_type == "user" and target_id:
+        candidates.append(("user", target_id))
+    if DIALPAD_COMPANY_ID:
+        candidates.append(("company", DIALPAD_COMPANY_ID))
+    return candidates
+
+
+def _stats_date_range(payload: Dict[str, Any]) -> tuple[str, str]:
+    occurred_at = _parse_occurred_at(payload.get("occurred_at"))
+    local_day = occurred_at.astimezone(_archive_timezone()).date().isoformat()
+    return local_day, local_day
+
+
+async def _fetch_stats_rows(
+    stat_type: str,
+    payload: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    if not (DIALPAD_ACCESS_TOKEN or DIALPAD_REFRESH_TOKEN):
+        return []
+
+    date_start, date_end = _stats_date_range(payload)
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        for target_type, target_id in _stats_target_candidates(payload):
+            try:
+                response = await _dialpad_request(
+                    "POST",
+                    f"{DIALPAD_API_BASE}/stats",
+                    client=client,
+                    json={
+                        "export_type": "records",
+                        "stat_type": stat_type,
+                        "target_type": target_type,
+                        "target_id": target_id,
+                        "date_start": date_start,
+                        "date_end": date_end,
+                        "timezone": ARCHIVE_TIMEZONE_NAME,
+                    },
+                    headers={"Content-Type": "application/json"},
+                )
+                response.raise_for_status()
+                body = response.json()
+                request_id = body.get("request_id") or body.get("id")
+                if not request_id:
+                    continue
+
+                if DIALPAD_STATS_POLL_WAIT:
+                    await asyncio.sleep(DIALPAD_STATS_POLL_WAIT)
+
+                for _ in range(DIALPAD_STATS_POLL_MAX):
+                    poll_response = await _dialpad_request(
+                        "GET",
+                        f"{DIALPAD_API_BASE}/stats/{request_id}",
+                        client=client,
+                    )
+                    poll_response.raise_for_status()
+                    poll_body = poll_response.json()
+                    download_url = (
+                        poll_body.get("download_url")
+                        or poll_body.get("url")
+                        or poll_body.get("file_url")
+                    )
+                    if download_url:
+                        download_response = await _dialpad_request("GET", download_url, client=client)
+                        download_response.raise_for_status()
+                        reader = csv.DictReader(io.StringIO(download_response.text.lstrip("\ufeff")))
+                        rows = [
+                            {
+                                str(key or "").strip().strip('"'): str(value or "").strip().strip('"')
+                                for key, value in row.items()
+                            }
+                            for row in reader
+                        ]
+                        if not rows:
+                            return []
+                        return rows
+                    state = str(poll_body.get("state") or poll_body.get("status") or "").lower()
+                    if state in {"failed", "error"}:
+                        break
+                    await asyncio.sleep(DIALPAD_STATS_POLL_RETRY)
+            except Exception:
+                continue
+    return []
+
+
+def _match_stats_row(rows: List[Dict[str, Any]], payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    call_id = _call_id_for_payload(payload)
+    external_id = str(payload.get("external_id") or "").strip()
+    for row in rows:
+        row_call_id = str(row.get("call_id") or row.get("id") or "").strip()
+        if call_id and row_call_id == call_id:
+            return row
+        if external_id and row_call_id == external_id:
+            return row
+    return None
+
+
+async def _fetch_call_detail(call_id: str) -> Dict[str, Any]:
+    if not (call_id and (DIALPAD_ACCESS_TOKEN or DIALPAD_REFRESH_TOKEN)):
+        return {}
+
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+        for path in (f"{DIALPAD_API_BASE}/call/{call_id}", f"{DIALPAD_API_BASE}/calls/{call_id}"):
+            try:
+                response = await _dialpad_request("GET", path, client=client)
+                response.raise_for_status()
+                body = response.json()
+                if isinstance(body, dict):
+                    return body
+            except Exception:
+                continue
+    return {}
+
+
+def _detail_candidates(detail: Dict[str, Any]) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    if not isinstance(detail, dict):
+        return candidates
+
+    direct_url = detail.get("recording_url") or detail.get("recording")
+    if _is_http_url(direct_url):
+        candidates.append(
+            {
+                "url": direct_url,
+                "recording_id": detail.get("recording_id"),
+                "recording_type": detail.get("recording_type") or "callrecording",
+                "duration_ms": detail.get("duration"),
+                "start_time": detail.get("start_time"),
+                "source": "call_detail_direct",
+            }
+        )
+
+    for detail_entry in detail.get("recording_details") or []:
+        if not isinstance(detail_entry, dict):
+            continue
+        candidates.append(
+            {
+                "url": detail_entry.get("url"),
+                "recording_id": detail_entry.get("id"),
+                "recording_type": detail_entry.get("recording_type") or "callrecording",
+                "duration_ms": detail_entry.get("duration"),
+                "start_time": detail_entry.get("start_time"),
+                "source": "call_detail_recording_details",
+            }
+        )
+
+    for field_name in ("admin_recording_urls", "call_recording_share_links", "admin_call_recording_share_links"):
+        field_value = detail.get(field_name)
+        if isinstance(field_value, list):
+            for item in field_value:
+                if _is_http_url(item):
+                    candidates.append(
+                        {
+                            "url": item,
+                            "recording_id": detail.get("recording_id"),
+                            "recording_type": "admincallrecording",
+                            "duration_ms": detail.get("duration"),
+                            "start_time": detail.get("start_time"),
+                            "source": field_name,
+                        }
+                    )
+                elif isinstance(item, dict):
+                    candidates.append(
+                        {
+                            "url": item.get("url") or item.get("access_link") or item.get("link"),
+                            "recording_id": item.get("recording_id") or detail.get("recording_id"),
+                            "recording_type": item.get("recording_type") or "admincallrecording",
+                            "duration_ms": item.get("duration") or detail.get("duration"),
+                            "start_time": item.get("start_time") or detail.get("start_time"),
+                            "source": field_name,
+                        }
+                    )
+
+    voicemail_share_link = detail.get("voicemail_share_link")
+    if _is_http_url(voicemail_share_link):
+        candidates.append(
+            {
+                "url": voicemail_share_link,
+                "recording_id": detail.get("voicemail_recording_id"),
+                "recording_type": "voicemail",
+                "duration_ms": detail.get("duration"),
+                "start_time": detail.get("start_time"),
+                "source": "call_detail_voicemail_share_link",
+            }
+        )
+    return candidates
+
+
+def _recording_candidates(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    source_metadata = payload.get("source_metadata") or {}
+    recording_references = payload.get("recording_references") or []
+
+    direct_url = source_metadata.get("recording_url")
+    if _is_http_url(direct_url):
+        candidates.append(
+            {
+                "url": direct_url,
+                "recording_id": source_metadata.get("voicemail_recording_id"),
+                "recording_type": "voicemail",
+                "duration_ms": source_metadata.get("duration"),
+                "start_time": source_metadata.get("date_started"),
+                "source": "source_metadata_recording_url",
+            }
+        )
+
+    voicemail_link = source_metadata.get("voicemail_link")
+    if _is_http_url(voicemail_link):
+        candidates.append(
+            {
+                "url": voicemail_link,
+                "recording_id": source_metadata.get("voicemail_recording_id"),
+                "recording_type": "voicemail",
+                "duration_ms": source_metadata.get("duration"),
+                "start_time": source_metadata.get("date_started"),
+                "source": "source_metadata_voicemail_link",
+            }
+        )
+
+    for detail in source_metadata.get("recording_details") or []:
+        if not isinstance(detail, dict):
+            continue
+        candidates.append(
+            {
+                "url": detail.get("url"),
+                "recording_id": detail.get("id"),
+                "recording_type": detail.get("recording_type"),
+                "duration_ms": detail.get("duration"),
+                "start_time": detail.get("start_time"),
+                "source": "recording_details",
+            }
+        )
+
+    for admin_url in source_metadata.get("admin_recording_urls") or []:
+        if _is_http_url(admin_url):
+            candidates.append(
+                {
+                    "url": admin_url,
+                    "recording_id": source_metadata.get("recording_id"),
+                    "recording_type": "admincallrecording",
+                    "duration_ms": source_metadata.get("duration"),
+                    "start_time": source_metadata.get("date_started"),
+                    "source": "source_metadata_admin_recording_urls",
+                }
+            )
 
     for ref in recording_references:
         if not isinstance(ref, dict):
@@ -272,25 +638,17 @@ def _recording_candidates(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
                 candidate["recording_type"] = "admincallrecording"
             else:
                 candidate["recording_type"] = "callrecording"
-        key = (
-            str(candidate.get("url") or ""),
-            str(candidate.get("recording_id") or ""),
-            str(candidate.get("recording_type") or ""),
-        )
-        if key not in seen:
-            seen.add(key)
-            candidates.append(candidate)
+        candidates.append(candidate)
 
-    return candidates
+    return _dedupe_candidates(candidates)
 
 
 async def _dialpad_api_request(method: str, url: str, json_body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     headers = {
-        "Authorization": f"Bearer {DIALPAD_API_TOKEN}",
         "Content-Type": "application/json",
     }
     async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-        response = await client.request(method, url, json=json_body, headers=headers)
+        response = await _dialpad_request(method, url, client=client, json=json_body, headers=headers)
         response.raise_for_status()
         payload = response.json()
         if isinstance(payload, dict):
@@ -305,7 +663,7 @@ async def _resolve_recording_url(candidate: Dict[str, Any]) -> Optional[str]:
 
     recording_id = str(candidate.get("recording_id") or "").strip()
     recording_type = str(candidate.get("recording_type") or "").strip()
-    if not (recording_id and recording_type and DIALPAD_API_TOKEN):
+    if not (recording_id and recording_type and (DIALPAD_ACCESS_TOKEN or DIALPAD_REFRESH_TOKEN)):
         return None
 
     share_payload = await _dialpad_api_request(
@@ -338,12 +696,80 @@ async def _resolve_recording_url(candidate: Dict[str, Any]) -> Optional[str]:
     return urls[0] if urls else None
 
 
+async def _resolve_payload_recordings(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    channel = _archive_channel(payload)
+    candidates = list(_recording_candidates(payload))
+    call_id = _call_id_for_payload(payload)
+
+    if call_id and (DIALPAD_ACCESS_TOKEN or DIALPAD_REFRESH_TOKEN):
+        call_detail = await _fetch_call_detail(call_id)
+        candidates.extend(_detail_candidates(call_detail))
+
+    if DIALPAD_ACCESS_TOKEN or DIALPAD_REFRESH_TOKEN:
+        if channel == "voicemail":
+            voicemail_rows = await _fetch_stats_rows("voicemails", payload)
+            voicemail_row = _match_stats_row(voicemail_rows, payload)
+            if voicemail_row:
+                candidates.append(
+                    {
+                        "url": voicemail_row.get("recording_url"),
+                        "recording_id": voicemail_row.get("voicemail_recording_id") or voicemail_row.get("recording_id"),
+                        "recording_type": "voicemail",
+                        "duration_ms": voicemail_row.get("duration"),
+                        "start_time": voicemail_row.get("date") or voicemail_row.get("date_started"),
+                        "source": "stats_voicemails",
+                    }
+                )
+
+        recordings_rows = await _fetch_stats_rows("recordings", payload)
+        recordings_row = _match_stats_row(recordings_rows, payload)
+        if recordings_row:
+            candidates.append(
+                {
+                    "url": recordings_row.get("recording_url"),
+                    "recording_id": recordings_row.get("recording_id"),
+                    "recording_type": recordings_row.get("recording_type") or "callrecording",
+                    "duration_ms": recordings_row.get("duration"),
+                    "start_time": recordings_row.get("date_started") or recordings_row.get("date"),
+                    "source": "stats_recordings",
+                }
+            )
+
+    if call_id:
+        source_metadata = payload.get("source_metadata") or {}
+        if channel == "voicemail" or source_metadata.get("voicemail_recording_id"):
+            candidates.append(
+                {
+                    "url": f"https://dialpad.com/v/{call_id}",
+                    "recording_id": source_metadata.get("voicemail_recording_id"),
+                    "recording_type": "voicemail",
+                    "duration_ms": source_metadata.get("duration"),
+                    "start_time": source_metadata.get("date_started"),
+                    "source": "dialpad_v_fallback",
+                }
+            )
+        else:
+            candidates.append(
+                {
+                    "url": f"https://dialpad.com/v/{call_id}",
+                    "recording_id": None,
+                    "recording_type": "callrecording",
+                    "duration_ms": source_metadata.get("duration"),
+                    "start_time": source_metadata.get("date_started"),
+                    "source": "dialpad_v_fallback",
+                }
+            )
+
+    return _dedupe_candidates(candidates)
+
+
 async def _download_audio_file(url: str) -> tuple[bytes, str, str]:
     headers = {}
-    if DIALPAD_API_TOKEN and url.startswith("https://dialpad.com/api/"):
-        headers["Authorization"] = f"Bearer {DIALPAD_API_TOKEN}"
     async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-        response = await client.get(url, headers=headers)
+        if _is_dialpad_url(url):
+            response = await _dialpad_request("GET", url, client=client, headers=headers)
+        else:
+            response = await client.get(url, headers=headers)
         response.raise_for_status()
         content_type = response.headers.get("content-type", "")
         if not content_type.lower().startswith("audio/"):
@@ -392,7 +818,7 @@ async def _download_recordings(
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     manifests: List[Dict[str, Any]] = []
     results: List[Dict[str, Any]] = []
-    candidates = _recording_candidates(payload)
+    candidates = await _resolve_payload_recordings(payload)
 
     for index, candidate in enumerate(candidates, start=1):
         try:
