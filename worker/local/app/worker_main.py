@@ -13,6 +13,7 @@ PRODUCT_WRITEBACK_URL = os.environ.get("PRODUCT_WRITEBACK_URL","").strip()
 PRODUCT_WRITEBACK_TOKEN = os.environ.get("PRODUCT_WRITEBACK_TOKEN","").strip()
 WORKER_ID = os.environ.get("WORKER_ID", os.environ.get("HOSTNAME", "talos_worker"))
 ENABLED_MODULES = {m.strip() for m in os.environ.get("ENABLED_MODULES","").split(",") if m.strip()}
+ENABLED_MODULES.add("archive_export")
 app = FastAPI(title="talos-worker", version="0.1.0")
 
 Handler = Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]
@@ -105,6 +106,7 @@ async def dispatch(req: DispatchRequest,
     return await _dispatch(req.model_dump())
 
 from modules import (  # noqa: E402,F401
+    archive_export,
     transcription, behavior_analysis, contact_engine_local,
     baseline_updates, deferred_backfill, popup_live_assist,
 )

@@ -18,11 +18,17 @@ services:
       PRODUCT_WRITEBACK_URL: ${PRODUCT_WRITEBACK_URL}
       PRODUCT_WRITEBACK_TOKEN: ${PRODUCT_WRITEBACK_TOKEN}
       ARTIFACT_ARCHIVE_DIR: /mnt/archive
+      DIALPAD_ARCHIVE_DIR: /mnt/dialpad_archive
+      DIALPAD_COMPANY_MAP_JSON: ${DIALPAD_COMPANY_MAP_JSON:-}
+      DIALPAD_COMPANY_FALLBACK: ${DIALPAD_COMPANY_FALLBACK:-UNMAPPED}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      ENABLED_MODULES: ${ENABLED_MODULES:-transcription,behavior_analysis,contact_engine_local,baseline_updates,deferred_backfill}
+      ENABLED_MODULES: ${ENABLED_MODULES:-transcription,archive_export,behavior_analysis,contact_engine_local,baseline_updates,deferred_backfill}
     volumes:
       - worker_work:/var/lib/talos/work
       - worker_cache:/root/.cache
+      - type: bind
+        source: ${DIALPAD_ARCHIVE_HOST_PATH}
+        target: /mnt/dialpad_archive
       # - //diskstation/talos-archive:/mnt/archive
     ports:
       - "8081:8081"

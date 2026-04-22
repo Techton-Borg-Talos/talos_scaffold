@@ -413,6 +413,43 @@ def _provider_recording_artifacts(evt: Dict, channel: str, event_uuid: str) -> L
     return refs
 
 
+def _archive_export_payload(
+    evt: Dict,
+    channel: str,
+    event_uuid: str,
+    occurred_at: datetime,
+    subject: Optional[str],
+    enriched_source_metadata: Dict,
+    provider_recording_artifacts: List[Dict],
+) -> Dict:
+    provider_transcript = (evt.get("transcription_text") or "").strip() or None
+    sms_text = None
+    if channel == "sms":
+        sms_text = (evt.get("text_content") or evt.get("text") or "").strip() or None
+
+    return {
+        "event_uuid": event_uuid,
+        "channel": channel,
+        "external_id": str(evt.get("call_id") or evt.get("id") or ""),
+        "occurred_at": occurred_at.isoformat(),
+        "subject": subject,
+        "source_metadata": enriched_source_metadata,
+        "source_provenance": _source_provenance(evt, channel),
+        "provider_transcript_text": provider_transcript,
+        "sms_text": sms_text,
+        "recording_references": [
+            {
+                "kind": ref["kind"],
+                "storage_scheme": ref["storage_scheme"],
+                "storage_uri": ref["storage_uri"],
+                "content_type": ref["content_type"],
+                "metadata": ref["metadata"],
+            }
+            for ref in provider_recording_artifacts
+        ],
+    }
+
+
 async def _insert_communication_event(evt: Dict, artifact: Dict) -> Dict:
     assert _pool is not None
 
@@ -487,6 +524,15 @@ async def _insert_communication_event(evt: Dict, artifact: Dict) -> Dict:
             event_uuid_str = str(event_uuid)
             provider_transcript = _provider_transcript_payload(evt, channel, event_uuid_str)
             provider_recording_artifacts = _provider_recording_artifacts(evt, channel, event_uuid_str)
+            archive_export_payload = _archive_export_payload(
+                evt,
+                channel,
+                event_uuid_str,
+                occurred_at,
+                subject,
+                enriched_source_metadata,
+                provider_recording_artifacts,
+            )
 
             await conn.execute(
                 """
@@ -698,6 +744,9 @@ async def _insert_communication_event(evt: Dict, artifact: Dict) -> Dict:
                 "participant_count": len(participants),
                 "participants": participants,
                 "remote_identifier": remote_identifier,
+                "occurred_at": occurred_at.isoformat(),
+                "subject": subject,
+                "archive_payload": archive_export_payload,
                 "provider_transcript_preserved": provider_transcript is not None,
                 "provider_recording_ref_count": len(provider_recording_artifacts),
             }
@@ -860,17 +909,38 @@ async def _enqueue_processing_jobs(normalized: Dict) -> Dict[str, int]:
     channel = normalized["channel"]
     enqueued_jobs = 0
 
-    jobs_to_queue: List[Tuple[str, Dict]] = []
+    jobs_to_queue: List[Tuple[str, Dict, str]] = []
+    archive_payload = normalized.get("archive_payload")
+    if archive_payload and channel in {"call", "voicemail", "sms"}:
+        archive_hash = hashlib.sha256(
+            json.dumps(archive_payload, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
+        jobs_to_queue.append(
+            (
+                "ARCHIVE_EXPORT",
+                archive_payload,
+                f"archive_export:{event_uuid}:{archive_hash}",
+            )
+        )
+
     if channel in {"call", "voicemail"}:
-        jobs_to_queue.append(("TRANSCRIBE", {"channel": channel}))
+        jobs_to_queue.append(
+            (
+                "TRANSCRIBE",
+                {
+                    "channel": channel,
+                    "archive": archive_payload,
+                },
+                f"transcribe:{event_uuid}",
+            )
+        )
 
     if not jobs_to_queue:
         return {"enqueued_jobs": 0}
 
     async with _pool.acquire() as conn:
         async with conn.transaction():
-            for job_type, payload in jobs_to_queue:
-                idempotency_key = f"{job_type.lower()}:{event_uuid}"
+            for job_type, payload, idempotency_key in jobs_to_queue:
                 row = await conn.fetchrow(
                     """
                     INSERT INTO processing_jobs
@@ -998,8 +1068,69 @@ async def worker_job_update(
                     json.dumps(result_payload),
                 )
 
-    if row is None:
-        raise HTTPException(404, "job not found")
+            if row is None:
+                raise HTTPException(404, "job not found")
+
+            if req.state == "SUCCEEDED":
+                job_row = await conn.fetchrow(
+                    """
+                    SELECT event_uuid
+                    FROM processing_jobs
+                    WHERE job_uuid = $1
+                    """,
+                    req.job_uuid,
+                )
+
+                archive_result = result_payload.get("result")
+                archive_files = (
+                    archive_result.get("archive_files")
+                    if isinstance(archive_result, dict)
+                    else None
+                )
+                event_uuid = job_row["event_uuid"] if job_row is not None else None
+
+                if event_uuid is not None and isinstance(archive_files, list) and archive_files:
+                    await conn.execute(
+                        """
+                        DELETE FROM event_artifacts
+                        WHERE event_uuid = $1 AND kind = 'worker_archive_file'
+                        """,
+                        event_uuid,
+                    )
+
+                    for archive_file in archive_files:
+                        await conn.execute(
+                            """
+                            INSERT INTO event_artifacts
+                            (
+                                event_uuid,
+                                kind,
+                                storage_scheme,
+                                storage_uri,
+                                sha256,
+                                byte_size,
+                                content_type,
+                                metadata
+                            )
+                            VALUES
+                            (
+                                $1,
+                                'worker_archive_file',
+                                $2,
+                                $3,
+                                NULL,
+                                $4,
+                                $5,
+                                $6::jsonb
+                            )
+                            """,
+                            event_uuid,
+                            archive_file.get("storage_scheme", "local"),
+                            archive_file.get("storage_uri", ""),
+                            archive_file.get("byte_size"),
+                            archive_file.get("content_type"),
+                            json.dumps(archive_file.get("metadata") or {}),
+                        )
 
     return {"ok": True, "job_uuid": req.job_uuid, "state": req.state}
 
