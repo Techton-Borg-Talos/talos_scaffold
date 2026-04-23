@@ -17,7 +17,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
-from worker_main import register
+try:
+    from worker_main import register
+except ModuleNotFoundError:
+    def register(job_type: str, module_name: str):  # type: ignore[misc]
+        def _wrap(fn):
+            return fn
+        return _wrap
 
 ARCHIVE_ROOT = Path(os.environ.get("DIALPAD_ARCHIVE_DIR", "/mnt/dialpad_archive"))
 DEFAULT_OFFICE_MAP = {
@@ -125,7 +131,8 @@ def _channel_dir(channel: str) -> str:
 
 def _archive_channel(payload: Dict[str, Any]) -> str:
     channel = str(payload.get("channel") or "other")
-    if payload.get("provider_transcript_text") or any(
+    source_metadata = payload.get("source_metadata") or {}
+    if channel == "voicemail" or source_metadata.get("voicemail_recording_id") or any(
         str((ref.get("metadata") or {}).get("reference_type") or "").startswith("voicemail")
         for ref in (payload.get("recording_references") or [])
         if isinstance(ref, dict)
