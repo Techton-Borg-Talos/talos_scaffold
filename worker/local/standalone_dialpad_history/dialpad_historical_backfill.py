@@ -1,20 +1,8 @@
-"""Historical Dialpad backfill into the TALOS archive layout.
+"""Standalone historical Dialpad backfill.
 
-This script fetches Dialpad historical records from the Stats API and archives
-them using the same file-preservation path as live webhook events.
-
-Default intent:
-    Backfill from 2026-01-01 up to today into the existing Dialpad archive.
-
-What it does:
-    - pulls calls, texts, voicemails, and recordings exports in date chunks
-    - best-effort fetches call AI transcripts via /api/v2/transcripts/{call_id}
-    - routes each historical item through modules.archive_export.handle_archive_export
-      so the final folders/files match the live system
-
-What it does not do yet:
-    - insert historical records into the AWS product Postgres database
-    - emit raw webhook artifacts (these events are historical API rows, not webhooks)
+This host-run script fetches historical Dialpad records from the Stats API and
+archives them directly into ``DIALPAD_ARCHIVE_ROOT`` using the same archive
+layout as the live system.
 """
 from __future__ import annotations
 
@@ -24,26 +12,22 @@ import csv
 import io
 import json
 import os
-import sys
+import textwrap
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
-from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import urlparse
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import httpx
 
-APP_ROOT = Path(__file__).resolve().parents[1]
-if str(APP_ROOT) not in sys.path:
-    sys.path.insert(0, str(APP_ROOT))
-
-from modules import archive_export as ae  # noqa: E402
+import dialpad_history_common as ae
 
 
 DEFAULT_START_DATE = "2026-01-01"
 DEFAULT_OFFICE_ID = "4943523498434560"
 DEFAULT_CHUNK_DAYS = 7
+DEFAULT_PROGRESS_EVERY = 10
 DEFAULT_TYPES = ("calls", "texts", "voicemails")
 
 
@@ -139,33 +123,135 @@ def _iter_date_chunks(start_day: date, end_day: date, chunk_days: int) -> Iterab
         current = chunk_end + timedelta(days=1)
 
 
+def _row_unique_key(stat_type: str, row: Dict[str, Any]) -> str:
+    if stat_type == "texts":
+        explicit = str(row.get("message_id") or row.get("id") or "").strip()
+        if explicit:
+            return explicit
+        sms_key = "|".join(
+            [
+                str(row.get("date") or "").strip(),
+                str(row.get("created_date") or "").strip(),
+                str(row.get("from_phone") or "").strip(),
+                str(row.get("to_phone") or "").strip(),
+                str(row.get("encrypted_aes_text") or row.get("encrypted_text") or row.get("text") or "").strip(),
+            ]
+        )
+        return str(uuid5(NAMESPACE_URL, f"dialpad-historical:texts:{sms_key}"))
+    if stat_type == "recordings":
+        recording_key = "|".join(
+            [
+                str(row.get("call_id") or row.get("id") or "").strip(),
+                str(row.get("recording_id") or "").strip(),
+                str(row.get("recording_url") or row.get("url") or "").strip(),
+                str(row.get("date_started") or row.get("date") or "").strip(),
+            ]
+        )
+        return str(uuid5(NAMESPACE_URL, f"dialpad-historical:recordings:{recording_key}"))
+    explicit = str(row.get("call_id") or row.get("id") or "").strip()
+    if explicit:
+        return explicit
+    return json.dumps(row, sort_keys=True)
+
+
+def _row_timestamp_candidates(stat_type: str, row: Dict[str, Any]) -> List[Any]:
+    if stat_type == "texts":
+        return [row.get("date"), row.get("created_date")]
+    if stat_type == "voicemails":
+        return [row.get("date"), row.get("date_started"), row.get("date_ended")]
+    return [
+        row.get("date_started"),
+        row.get("date_connected"),
+        row.get("date_ended"),
+        row.get("date"),
+    ]
+
+
+def _row_local_day(stat_type: str, row: Dict[str, Any]) -> Optional[date]:
+    archive_tz = ae._archive_timezone()
+    for candidate in _row_timestamp_candidates(stat_type, row):
+        parsed = _parse_timestamp(candidate)
+        if parsed is not None:
+            return parsed.astimezone(archive_tz).date()
+    return None
+
+
+def _sort_rows_for_archive(stat_type: str, rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    def _sort_key(row: Dict[str, str]) -> tuple[str, str]:
+        parsed_text = ""
+        for candidate in _row_timestamp_candidates(stat_type, row):
+            parsed = _parse_timestamp(candidate)
+            if parsed is not None:
+                parsed_text = parsed.astimezone(timezone.utc).isoformat()
+                break
+        return parsed_text, _row_unique_key(stat_type, row)
+
+    return sorted(rows, key=_sort_key)
+
+
+def _filter_rows_to_chunk(
+    stat_type: str,
+    rows: List[Dict[str, str]],
+    chunk_start: date,
+    chunk_end: date,
+) -> tuple[List[Dict[str, str]], int]:
+    kept: List[Dict[str, str]] = []
+    dropped = 0
+    for row in rows:
+        local_day = _row_local_day(stat_type, row)
+        if local_day is not None and not (chunk_start <= local_day <= chunk_end):
+            dropped += 1
+            continue
+        kept.append(row)
+    return kept, dropped
+
+
+def _should_log_archive_progress(index: int, total: int, every: int) -> bool:
+    if total <= 0:
+        return False
+    if index == 1 or index == total:
+        return True
+    return every > 0 and index % every == 0
+
+
 def _deterministic_event_uuid(channel: str, external_id: str) -> str:
     return str(uuid5(NAMESPACE_URL, f"dialpad-historical:{channel}:{external_id}"))
 
 
-def _default_target(target_type: Optional[str], target_id: Optional[str]) -> tuple[str, str]:
+def _stats_target_candidates(target_type: Optional[str], target_id: Optional[str], office_id: str) -> List[tuple[str, str]]:
     explicit_type = str(target_type or "").strip().lower()
     explicit_id = str(target_id or "").strip()
     if explicit_type and explicit_id:
-        return explicit_type, explicit_id
+        return [(explicit_type, explicit_id)]
 
     env_type = os.environ.get("DIALPAD_BACKFILL_TARGET_TYPE", "").strip().lower()
     env_id = os.environ.get("DIALPAD_BACKFILL_TARGET_ID", "").strip()
     if env_type and env_id:
-        return env_type, env_id
+        return [(env_type, env_id)]
 
-    if ae.DIALPAD_COMPANY_ID:
-        return "company", ae.DIALPAD_COMPANY_ID
-
-    office_id = os.environ.get("DIALPAD_OFFICE_ID", DEFAULT_OFFICE_ID).strip()
+    candidates: List[tuple[str, str]] = []
     if office_id:
-        return "office", office_id
+        candidates.append(("office", office_id))
 
     user_id = os.environ.get("DIALPAD_USER_ID", "").strip()
     if user_id:
-        return "user", user_id
+        candidates.append(("user", user_id))
 
-    raise SystemExit("No Dialpad backfill target configured. Set DIALPAD_BACKFILL_TARGET_ID or DIALPAD_COMPANY_ID.")
+    if ae.DIALPAD_COMPANY_ID:
+        candidates.append(("company", ae.DIALPAD_COMPANY_ID))
+
+    deduped: List[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        deduped.append(candidate)
+    if deduped:
+        return deduped
+    raise SystemExit(
+        "No Dialpad backfill target configured. Set DIALPAD_BACKFILL_TARGET_ID or one of DIALPAD_OFFICE_ID/DIALPAD_USER_ID/DIALPAD_COMPANY_ID."
+    )
 
 
 def _base_target_metadata(internal_number: Optional[str], office_id: str) -> Dict[str, Any]:
@@ -282,54 +368,77 @@ async def _fetch_csv_rows(
     date_end: str,
 ) -> List[Dict[str, str]]:
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-        response = await ae._dialpad_request(
-            "POST",
-            f"{ae.DIALPAD_API_BASE}/stats",
-            client=client,
-            json={
-                "export_type": "records",
-                "stat_type": stat_type,
-                "target_type": target_type,
-                "target_id": target_id,
-                "date_start": date_start,
-                "date_end": date_end,
-                "timezone": ae.ARCHIVE_TIMEZONE_NAME,
-            },
-            headers={"Content-Type": "application/json"},
-        )
-        response.raise_for_status()
-        body = response.json()
-        request_id = body.get("request_id") or body.get("id")
-        if not request_id:
-            return []
-
-        if ae.DIALPAD_STATS_POLL_WAIT:
-            await asyncio.sleep(ae.DIALPAD_STATS_POLL_WAIT)
-
-        for _ in range(ae.DIALPAD_STATS_POLL_MAX):
-            poll = await ae._dialpad_request(
-                "GET",
-                f"{ae.DIALPAD_API_BASE}/stats/{request_id}",
+        last_error: Optional[httpx.HTTPStatusError] = None
+        for stats_timezone in ae._dialpad_stats_timezones():
+            response = await ae._dialpad_request(
+                "POST",
+                f"{ae.DIALPAD_API_BASE}/stats",
                 client=client,
+                json={
+                    "export_type": "records",
+                    "stat_type": stat_type,
+                    "target_type": target_type,
+                    "target_id": target_id,
+                    "date_start": date_start,
+                    "date_end": date_end,
+                    "timezone": stats_timezone,
+                },
+                headers={"Content-Type": "application/json"},
             )
-            poll.raise_for_status()
-            poll_body = poll.json()
-            download_url = poll_body.get("download_url") or poll_body.get("url") or poll_body.get("file_url")
-            if download_url:
-                download = await ae._dialpad_request("GET", download_url, client=client)
-                download.raise_for_status()
-                reader = csv.DictReader(io.StringIO(download.text.lstrip("\ufeff")))
-                return [
-                    {
-                        str(key or "").strip().strip('"'): str(value or "").strip().strip('"')
-                        for key, value in row.items()
-                    }
-                    for row in reader
-                ]
-            state = str(poll_body.get("state") or poll_body.get("status") or "").lower()
-            if state in {"failed", "error"}:
+            if response.is_error:
+                body = response.text.strip()
+                if response.status_code == 400 and "Invalid timezone name" in body:
+                    continue
+                detail = body
+                try:
+                    parsed = response.json()
+                    detail = json.dumps(parsed, sort_keys=True)
+                except Exception:
+                    pass
+                detail = textwrap.shorten(detail.replace("\n", " "), width=500, placeholder="...")
+                last_error = httpx.HTTPStatusError(
+                    f"Dialpad stats request failed for stat_type={stat_type} "
+                    f"target={target_type}:{target_id} {date_start}->{date_end}: "
+                    f"HTTP {response.status_code} {detail}",
+                    request=response.request,
+                    response=response,
+                )
+                break
+            body = response.json()
+            request_id = body.get("request_id") or body.get("id")
+            if not request_id:
                 return []
-            await asyncio.sleep(ae.DIALPAD_STATS_POLL_RETRY)
+
+            if ae.DIALPAD_STATS_POLL_WAIT:
+                await asyncio.sleep(ae.DIALPAD_STATS_POLL_WAIT)
+
+            for _ in range(ae.DIALPAD_STATS_POLL_MAX):
+                poll = await ae._dialpad_request(
+                    "GET",
+                    f"{ae.DIALPAD_API_BASE}/stats/{request_id}",
+                    client=client,
+                )
+                poll.raise_for_status()
+                poll_body = poll.json()
+                download_url = poll_body.get("download_url") or poll_body.get("url") or poll_body.get("file_url")
+                if download_url:
+                    download = await ae._dialpad_request("GET", download_url, client=client)
+                    download.raise_for_status()
+                    reader = csv.DictReader(io.StringIO(download.text.lstrip("\ufeff")))
+                    return [
+                        {
+                            str(key or "").strip().strip('"'): str(value or "").strip().strip('"')
+                            for key, value in row.items()
+                        }
+                        for row in reader
+                    ]
+                state = str(poll_body.get("state") or poll_body.get("status") or "").lower()
+                if state in {"failed", "error"}:
+                    return []
+                await asyncio.sleep(ae.DIALPAD_STATS_POLL_RETRY)
+            return []
+        if last_error is not None:
+            raise last_error
     return []
 
 
@@ -582,47 +691,55 @@ async def _archive_call_row(
     return await ae.handle_archive_export(job)
 
 
-async def _fetch_rows_for_chunks(
+async def _fetch_rows_for_chunk(
     *,
     stat_type: str,
-    start_day: date,
-    end_day: date,
-    chunk_days: int,
-    target_type: str,
-    target_id: str,
+    chunk_start: date,
+    chunk_end: date,
+    target_candidates: List[tuple[str, str]],
 ) -> List[Dict[str, str]]:
-    rows: List[Dict[str, str]] = []
-    seen_keys: set[str] = set()
-    for chunk_start, chunk_end in _iter_date_chunks(start_day, end_day, chunk_days):
-        chunk_rows = await _fetch_csv_rows(
-            stat_type=stat_type,
-            target_type=target_type,
-            target_id=target_id,
-            date_start=chunk_start.isoformat(),
-            date_end=chunk_end.isoformat(),
-        )
-        for row in chunk_rows:
-            key = (
-                str(row.get("message_id") or row.get("call_id") or row.get("id") or "").strip()
-                or json.dumps(row, sort_keys=True)
+    chunk_rows: List[Dict[str, str]] = []
+    last_error: Optional[Exception] = None
+    for candidate_type, candidate_id in target_candidates:
+        try:
+            chunk_rows = await _fetch_csv_rows(
+                stat_type=stat_type,
+                target_type=candidate_type,
+                target_id=candidate_id,
+                date_start=chunk_start.isoformat(),
+                date_end=chunk_end.isoformat(),
             )
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            rows.append(row)
-        print(
-            f"[DIALPAD_BACKFILL] {stat_type} {chunk_start.isoformat()} -> {chunk_end.isoformat()} : "
-            f"{len(chunk_rows)} rows ({len(rows)} unique cumulative)"
-        )
-    return rows
+            print(
+                f"[DIALPAD_BACKFILL] {stat_type} chunk {chunk_start.isoformat()} -> {chunk_end.isoformat()} "
+                f"used target {candidate_type}:{candidate_id}"
+            )
+            break
+        except httpx.HTTPStatusError as exc:
+            last_error = exc
+            status = exc.response.status_code if exc.response is not None else "unknown"
+            print(
+                f"[DIALPAD_BACKFILL] {stat_type} target {candidate_type}:{candidate_id} failed "
+                f"with HTTP {status}; trying next target"
+            )
+            continue
+    if not chunk_rows and last_error is not None:
+        raise last_error
+
+    filtered_rows, dropped_rows = _filter_rows_to_chunk(stat_type, chunk_rows, chunk_start, chunk_end)
+    print(
+        f"[DIALPAD_BACKFILL] {stat_type} {chunk_start.isoformat()} -> {chunk_end.isoformat()} : "
+        f"{len(chunk_rows)} raw rows, {len(filtered_rows)} in-window, {dropped_rows} out-of-window"
+    )
+    return _sort_rows_for_archive(stat_type, filtered_rows)
 
 
 async def run_backfill(args: argparse.Namespace) -> Dict[str, Any]:
-    target_type, target_id = _default_target(args.target_type, args.target_id)
     office_id = args.office_id or os.environ.get("DIALPAD_OFFICE_ID", DEFAULT_OFFICE_ID).strip()
+    target_candidates = _stats_target_candidates(args.target_type, args.target_id, office_id)
     start_day = _parse_date(args.start_date)
     end_day = _parse_date(args.end_date) if args.end_date else datetime.now(ae._archive_timezone()).date()
     chunk_days = max(1, args.chunk_days)
+    progress_every = max(1, args.progress_every)
     requested_types = {item.lower() for item in args.types}
 
     if not (ae.DIALPAD_ACCESS_TOKEN or ae.DIALPAD_REFRESH_TOKEN):
@@ -631,87 +748,177 @@ async def run_backfill(args: argparse.Namespace) -> Dict[str, Any]:
     summary: Dict[str, Any] = {
         "start_date": start_day.isoformat(),
         "end_date": end_day.isoformat(),
-        "target_type": target_type,
-        "target_id": target_id,
+        "target_type": target_candidates[0][0],
+        "target_id": target_candidates[0][1],
+        "target_candidates": [
+            {"target_type": candidate_type, "target_id": candidate_id}
+            for candidate_type, candidate_id in target_candidates
+        ],
         "chunk_days": chunk_days,
+        "progress_every": progress_every,
         "counts": {},
     }
 
-    rows_by_type: Dict[str, List[Dict[str, str]]] = {}
-    if "calls" in requested_types:
-        rows_by_type["calls"] = await _fetch_rows_for_chunks(
-            stat_type="calls",
-            start_day=start_day,
-            end_day=end_day,
-            chunk_days=chunk_days,
-            target_type=target_type,
-            target_id=target_id,
-        )
-    if "texts" in requested_types:
-        rows_by_type["texts"] = await _fetch_rows_for_chunks(
-            stat_type="texts",
-            start_day=start_day,
-            end_day=end_day,
-            chunk_days=chunk_days,
-            target_type=target_type,
-            target_id=target_id,
-        )
-    if "voicemails" in requested_types:
-        rows_by_type["voicemails"] = await _fetch_rows_for_chunks(
-            stat_type="voicemails",
-            start_day=start_day,
-            end_day=end_day,
-            chunk_days=chunk_days,
-            target_type=target_type,
-            target_id=target_id,
-        )
-
-    recordings_rows: List[Dict[str, str]] = []
-    if "calls" in requested_types:
-        recordings_rows = await _fetch_rows_for_chunks(
-            stat_type="recordings",
-            start_day=start_day,
-            end_day=end_day,
-            chunk_days=chunk_days,
-            target_type=target_type,
-            target_id=target_id,
-        )
-    recordings_by_call_id: Dict[str, List[Dict[str, str]]] = defaultdict(list)
-    for row in recordings_rows:
-        call_id = str(row.get("call_id") or row.get("id") or "").strip()
-        if call_id:
-            recordings_by_call_id[call_id].append(row)
-
-    archived_counts = {"calls": 0, "texts": 0, "voicemails": 0}
-
-    for row in rows_by_type.get("texts", []):
-        await _archive_sms_row(row, start_day, office_id)
-        archived_counts["texts"] += 1
-
-    for row in rows_by_type.get("voicemails", []):
-        await _archive_voicemail_row(row, start_day, office_id)
-        archived_counts["voicemails"] += 1
-
-    for row in rows_by_type.get("calls", []):
-        call_id = str(row.get("call_id") or row.get("id") or "").strip()
-        await _archive_call_row(
-            row,
-            start_day,
-            office_id,
-            recordings_by_call_id.get(call_id, []),
-            include_call_transcripts=not args.skip_call_transcripts,
-        )
-        archived_counts["calls"] += 1
-
-    summary["counts"] = {
-        "calls_rows": len(rows_by_type.get("calls", [])),
-        "texts_rows": len(rows_by_type.get("texts", [])),
-        "voicemails_rows": len(rows_by_type.get("voicemails", [])),
-        "recordings_rows": len(recordings_rows),
-        "calls_archived": archived_counts["calls"],
-        "texts_archived": archived_counts["texts"],
-        "voicemails_archived": archived_counts["voicemails"],
+    chunks = list(_iter_date_chunks(start_day, end_day, chunk_days))
+    seen_keys: Dict[str, set[str]] = {
+        "calls": set(),
+        "texts": set(),
+        "voicemails": set(),
+        "recordings": set(),
     }
+    recordings_by_call_id: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+    counts = {
+        "calls_rows": 0,
+        "texts_rows": 0,
+        "voicemails_rows": 0,
+        "recordings_rows": 0,
+        "calls_archived": 0,
+        "texts_archived": 0,
+        "voicemails_archived": 0,
+    }
+
+    for chunk_index, (chunk_start, chunk_end) in enumerate(chunks, start=1):
+        print(
+            f"[DIALPAD_BACKFILL] chunk {chunk_index}/{len(chunks)} "
+            f"{chunk_start.isoformat()} -> {chunk_end.isoformat()} starting"
+        )
+
+        if "texts" in requested_types:
+            text_rows = await _fetch_rows_for_chunk(
+                stat_type="texts",
+                chunk_start=chunk_start,
+                chunk_end=chunk_end,
+                target_candidates=target_candidates,
+            )
+            new_text_rows: List[Dict[str, str]] = []
+            duplicate_texts = 0
+            for row in text_rows:
+                key = _row_unique_key("texts", row)
+                if key in seen_keys["texts"]:
+                    duplicate_texts += 1
+                    continue
+                seen_keys["texts"].add(key)
+                new_text_rows.append(row)
+            counts["texts_rows"] += len(new_text_rows)
+            print(
+                f"[DIALPAD_BACKFILL] texts chunk {chunk_index}/{len(chunks)} retained "
+                f"{len(new_text_rows)} new rows, skipped {duplicate_texts} duplicates "
+                f"({counts['texts_rows']} unique cumulative)"
+            )
+            for row_index, row in enumerate(new_text_rows, start=1):
+                await _archive_sms_row(row, chunk_start, office_id)
+                counts["texts_archived"] += 1
+                if _should_log_archive_progress(row_index, len(new_text_rows), progress_every):
+                    print(
+                        f"[DIALPAD_BACKFILL] archive texts chunk {chunk_index}/{len(chunks)} "
+                        f"{row_index}/{len(new_text_rows)} complete "
+                        f"({counts['texts_archived']} cumulative archived)"
+                    )
+
+        if "voicemails" in requested_types:
+            voicemail_rows = await _fetch_rows_for_chunk(
+                stat_type="voicemails",
+                chunk_start=chunk_start,
+                chunk_end=chunk_end,
+                target_candidates=target_candidates,
+            )
+            new_voicemail_rows: List[Dict[str, str]] = []
+            duplicate_voicemails = 0
+            for row in voicemail_rows:
+                key = _row_unique_key("voicemails", row)
+                if key in seen_keys["voicemails"]:
+                    duplicate_voicemails += 1
+                    continue
+                seen_keys["voicemails"].add(key)
+                new_voicemail_rows.append(row)
+            counts["voicemails_rows"] += len(new_voicemail_rows)
+            print(
+                f"[DIALPAD_BACKFILL] voicemails chunk {chunk_index}/{len(chunks)} retained "
+                f"{len(new_voicemail_rows)} new rows, skipped {duplicate_voicemails} duplicates "
+                f"({counts['voicemails_rows']} unique cumulative)"
+            )
+            for row_index, row in enumerate(new_voicemail_rows, start=1):
+                await _archive_voicemail_row(row, chunk_start, office_id)
+                counts["voicemails_archived"] += 1
+                if _should_log_archive_progress(row_index, len(new_voicemail_rows), progress_every):
+                    print(
+                        f"[DIALPAD_BACKFILL] archive voicemails chunk {chunk_index}/{len(chunks)} "
+                        f"{row_index}/{len(new_voicemail_rows)} complete "
+                        f"({counts['voicemails_archived']} cumulative archived)"
+                    )
+
+        if "calls" in requested_types:
+            recording_rows = await _fetch_rows_for_chunk(
+                stat_type="recordings",
+                chunk_start=chunk_start,
+                chunk_end=chunk_end,
+                target_candidates=target_candidates,
+            )
+            new_recording_rows: List[Dict[str, str]] = []
+            duplicate_recordings = 0
+            for row in recording_rows:
+                key = _row_unique_key("recordings", row)
+                if key in seen_keys["recordings"]:
+                    duplicate_recordings += 1
+                    continue
+                seen_keys["recordings"].add(key)
+                new_recording_rows.append(row)
+            counts["recordings_rows"] += len(new_recording_rows)
+            for row in new_recording_rows:
+                call_id = str(row.get("call_id") or row.get("id") or "").strip()
+                if call_id:
+                    recordings_by_call_id[call_id].append(row)
+            print(
+                f"[DIALPAD_BACKFILL] recordings chunk {chunk_index}/{len(chunks)} retained "
+                f"{len(new_recording_rows)} new rows, skipped {duplicate_recordings} duplicates "
+                f"({counts['recordings_rows']} unique cumulative)"
+            )
+
+            call_rows = await _fetch_rows_for_chunk(
+                stat_type="calls",
+                chunk_start=chunk_start,
+                chunk_end=chunk_end,
+                target_candidates=target_candidates,
+            )
+            new_call_rows: List[Dict[str, str]] = []
+            duplicate_calls = 0
+            for row in call_rows:
+                key = _row_unique_key("calls", row)
+                if key in seen_keys["calls"]:
+                    duplicate_calls += 1
+                    continue
+                seen_keys["calls"].add(key)
+                new_call_rows.append(row)
+            counts["calls_rows"] += len(new_call_rows)
+            print(
+                f"[DIALPAD_BACKFILL] calls chunk {chunk_index}/{len(chunks)} retained "
+                f"{len(new_call_rows)} new rows, skipped {duplicate_calls} duplicates "
+                f"({counts['calls_rows']} unique cumulative)"
+            )
+            for row_index, row in enumerate(new_call_rows, start=1):
+                call_id = str(row.get("call_id") or row.get("id") or "").strip()
+                await _archive_call_row(
+                    row,
+                    chunk_start,
+                    office_id,
+                    recordings_by_call_id.get(call_id, []),
+                    include_call_transcripts=not args.skip_call_transcripts,
+                )
+                counts["calls_archived"] += 1
+                if _should_log_archive_progress(row_index, len(new_call_rows), progress_every):
+                    print(
+                        f"[DIALPAD_BACKFILL] archive calls chunk {chunk_index}/{len(chunks)} "
+                        f"{row_index}/{len(new_call_rows)} complete "
+                        f"({counts['calls_archived']} cumulative archived)"
+                    )
+
+        print(
+            f"[DIALPAD_BACKFILL] chunk {chunk_index}/{len(chunks)} complete: "
+            f"calls={counts['calls_archived']} texts={counts['texts_archived']} "
+            f"voicemails={counts['voicemails_archived']} recordings={counts['recordings_rows']}"
+        )
+
+    summary["counts"] = counts
     return summary
 
 
@@ -730,6 +937,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-type", default="", help="Dialpad stats target type (company, office, user).")
     parser.add_argument("--target-id", default="", help="Dialpad stats target id.")
     parser.add_argument("--office-id", default="", help="Office id used in archived source provenance.")
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=DEFAULT_PROGRESS_EVERY,
+        help="Print archive progress every N items within each chunk.",
+    )
     parser.add_argument(
         "--skip-call-transcripts",
         action="store_true",

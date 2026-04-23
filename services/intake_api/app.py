@@ -10,7 +10,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
 import asyncpg
 import httpx
@@ -329,8 +329,113 @@ def _enriched_source_metadata(evt: Dict, channel: str) -> Dict:
     return payload
 
 
+def _normalized_lookup_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def _iter_named_values(obj: Any, target_keys: Iterable[str]) -> Iterable[Any]:
+    normalized_targets = {_normalized_lookup_key(key) for key in target_keys}
+
+    def _walk(value: Any) -> Iterable[Any]:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if _normalized_lookup_key(key) in normalized_targets:
+                    yield child
+                yield from _walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from _walk(child)
+
+    yield from _walk(obj)
+
+
+def _clean_text_candidate(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    text = value.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return None
+    lowered = text.lower()
+    if lowered.startswith("http://") or lowered.startswith("https://"):
+        return None
+    return text
+
+
+def _first_text_candidate(obj: Any, target_keys: Iterable[str]) -> Optional[str]:
+    for value in _iter_named_values(obj, target_keys):
+        text = _clean_text_candidate(value)
+        if text:
+            return text
+    return None
+
+
+def _extract_action_items(obj: Any) -> List[str]:
+    action_items: List[str] = []
+    for value in _iter_named_values(obj, ("action_items", "actionItems", "next_steps", "tasks", "todos")):
+        if isinstance(value, str):
+            text = _clean_text_candidate(value)
+            if text:
+                action_items.append(text)
+            continue
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, str):
+                    text = _clean_text_candidate(item)
+                    if text:
+                        action_items.append(text)
+                elif isinstance(item, dict):
+                    for candidate_key in ("text", "label", "title", "description", "body"):
+                        text = _clean_text_candidate(item.get(candidate_key))
+                        if text:
+                            action_items.append(text)
+                            break
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for item in action_items:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped
+
+
+def _provider_summary_payload(evt: Dict, channel: str, event_uuid: str) -> Dict[str, Any]:
+    summary_text = _first_text_candidate(
+        evt,
+        (
+            "summary",
+            "ai_summary",
+            "call_summary",
+            "review_summary",
+            "conversation_summary",
+            "recap",
+        ),
+    )
+    action_items = _extract_action_items(evt)
+    provenance = _source_provenance(evt, channel)
+    return {
+        "event_uuid": event_uuid,
+        "summary_text": summary_text,
+        "action_items": action_items,
+        "metadata": {
+            "provider": "dialpad",
+            "provider_state": evt.get("state"),
+            "source_provenance": provenance,
+        },
+    }
+
+
 def _provider_transcript_payload(evt: Dict, channel: str, event_uuid: str) -> Optional[Dict]:
-    text = (evt.get("transcription_text") or "").strip()
+    text = _first_text_candidate(
+        evt,
+        (
+            "transcription_text",
+            "transcript_text",
+            "transcript",
+            "transcription",
+            "full_transcript",
+        ),
+    )
     if not text:
         return None
     provenance = _source_provenance(evt, channel)
@@ -357,6 +462,27 @@ def _provider_recording_artifacts(evt: Dict, channel: str, event_uuid: str) -> L
     provenance = _source_provenance(evt, channel)
     refs: List[Dict] = []
     recording_details = evt.get("recording_details") or []
+    direct_recording_url = evt.get("recording_url") or evt.get("recording")
+
+    if direct_recording_url:
+        refs.append(
+            {
+                "event_uuid": event_uuid,
+                "kind": "provider_recording_reference",
+                "storage_scheme": "dialpad",
+                "storage_uri": str(direct_recording_url),
+                "content_type": "text/uri-list",
+                "metadata": {
+                    "provider": "dialpad",
+                    "reference_type": "recording_url",
+                    "recording_id": evt.get("recording_id"),
+                    "recording_type": evt.get("recording_type") or "callrecording",
+                    "duration_ms": evt.get("duration"),
+                    "start_time": evt.get("date_started") or evt.get("start_time"),
+                    "source_provenance": provenance,
+                },
+            }
+        )
 
     voicemail_link = evt.get("voicemail_link")
     if voicemail_link:
@@ -436,6 +562,75 @@ def _provider_recording_artifacts(evt: Dict, channel: str, event_uuid: str) -> L
             }
         )
 
+    if evt.get("recording_id"):
+        refs.append(
+            {
+                "event_uuid": event_uuid,
+                "kind": "provider_recording_reference",
+                "storage_scheme": "dialpad",
+                "storage_uri": f"dialpad://call_recording/{evt.get('recording_id')}",
+                "content_type": "application/x.dialpad.recording-reference",
+                "metadata": {
+                    "provider": "dialpad",
+                    "reference_type": "recording_id",
+                    "recording_id": evt.get("recording_id"),
+                    "recording_type": evt.get("recording_type") or "callrecording",
+                    "source_provenance": provenance,
+                },
+            }
+        )
+
+    for field_name, default_type in (
+        ("admin_recording_urls", "admincallrecording"),
+        ("call_recording_share_links", "callrecording"),
+        ("admin_call_recording_share_links", "admincallrecording"),
+    ):
+        field_value = evt.get(field_name) or []
+        if not isinstance(field_value, list):
+            continue
+        for item in field_value:
+            if isinstance(item, str):
+                refs.append(
+                    {
+                        "event_uuid": event_uuid,
+                        "kind": "provider_recording_reference",
+                        "storage_scheme": "dialpad",
+                        "storage_uri": item,
+                        "content_type": "text/uri-list",
+                        "metadata": {
+                            "provider": "dialpad",
+                            "reference_type": field_name,
+                            "recording_id": evt.get("recording_id"),
+                            "recording_type": default_type,
+                            "duration_ms": evt.get("duration"),
+                            "start_time": evt.get("date_started") or evt.get("start_time"),
+                            "source_provenance": provenance,
+                        },
+                    }
+                )
+            elif isinstance(item, dict):
+                storage_uri = str(item.get("url") or item.get("access_link") or item.get("link") or "").strip()
+                if not storage_uri:
+                    continue
+                refs.append(
+                    {
+                        "event_uuid": event_uuid,
+                        "kind": "provider_recording_reference",
+                        "storage_scheme": "dialpad",
+                        "storage_uri": storage_uri,
+                        "content_type": "text/uri-list",
+                        "metadata": {
+                            "provider": "dialpad",
+                            "reference_type": field_name,
+                            "recording_id": item.get("recording_id") or evt.get("recording_id"),
+                            "recording_type": item.get("recording_type") or default_type,
+                            "duration_ms": item.get("duration") or evt.get("duration"),
+                            "start_time": item.get("start_time") or evt.get("date_started") or evt.get("start_time"),
+                            "source_provenance": provenance,
+                        },
+                    }
+                )
+
     return refs
 
 
@@ -448,7 +643,17 @@ def _archive_export_payload(
     enriched_source_metadata: Dict,
     provider_recording_artifacts: List[Dict],
 ) -> Dict:
-    provider_transcript = (evt.get("transcription_text") or "").strip() or None
+    provider_transcript = _first_text_candidate(
+        evt,
+        (
+            "transcription_text",
+            "transcript_text",
+            "transcript",
+            "transcription",
+            "full_transcript",
+        ),
+    )
+    provider_summary = _provider_summary_payload(evt, channel, event_uuid)
     sms_text = None
     if channel == "sms":
         sms_text = (evt.get("text_content") or evt.get("text") or "").strip() or None
@@ -462,6 +667,8 @@ def _archive_export_payload(
         "source_metadata": enriched_source_metadata,
         "source_provenance": _source_provenance(evt, channel),
         "provider_transcript_text": provider_transcript,
+        "provider_summary_text": provider_summary.get("summary_text"),
+        "provider_action_items": provider_summary.get("action_items") or [],
         "sms_text": sms_text,
         "recording_references": [
             {
@@ -495,6 +702,8 @@ def _archive_payload_signature(archive_payload: Dict) -> str:
         "event_uuid": archive_payload.get("event_uuid"),
         "channel": archive_payload.get("channel"),
         "provider_transcript_text": archive_payload.get("provider_transcript_text") or None,
+        "provider_summary_text": archive_payload.get("provider_summary_text") or None,
+        "provider_action_items": archive_payload.get("provider_action_items") or [],
         "sms_text": archive_payload.get("sms_text") or None,
         "recording_references": sorted(
             recording_refs,
@@ -584,6 +793,7 @@ async def _insert_communication_event(evt: Dict, artifact: Dict) -> Dict:
             event_uuid = row["event_uuid"]
             event_uuid_str = str(event_uuid)
             provider_transcript = _provider_transcript_payload(evt, channel, event_uuid_str)
+            provider_summary = _provider_summary_payload(evt, channel, event_uuid_str)
             provider_recording_artifacts = _provider_recording_artifacts(evt, channel, event_uuid_str)
             archive_export_payload = _archive_export_payload(
                 evt,
@@ -809,6 +1019,8 @@ async def _insert_communication_event(evt: Dict, artifact: Dict) -> Dict:
                 "subject": subject,
                 "archive_payload": archive_export_payload,
                 "provider_transcript_preserved": provider_transcript is not None,
+                "provider_summary_preserved": bool(provider_summary.get("summary_text")),
+                "provider_action_item_count": len(provider_summary.get("action_items") or []),
                 "provider_recording_ref_count": len(provider_recording_artifacts),
             }
 
@@ -1045,7 +1257,7 @@ async def dialpad(request: Request):
     jobs = await _enqueue_processing_jobs(normalized)
 
     LOG.info(
-        "dialpad accepted: artifact=%s event_uuid=%s channel=%s external_id=%s participants=%s contacts=%s candidates=%s jobs=%s provider_transcript=%s recording_refs=%s",
+        "dialpad accepted: artifact=%s event_uuid=%s channel=%s external_id=%s participants=%s contacts=%s candidates=%s jobs=%s provider_transcript=%s provider_summary=%s action_items=%s recording_refs=%s",
         artifact["artifact_uuid"],
         normalized["event_uuid"],
         normalized["channel"],
@@ -1055,6 +1267,8 @@ async def dialpad(request: Request):
         resolution["linked_candidates"],
         jobs["enqueued_jobs"],
         normalized["provider_transcript_preserved"],
+        normalized["provider_summary_preserved"],
+        normalized["provider_action_item_count"],
         normalized["provider_recording_ref_count"],
     )
 
@@ -1068,6 +1282,8 @@ async def dialpad(request: Request):
         "linked_candidates": resolution["linked_candidates"],
         "enqueued_jobs": jobs["enqueued_jobs"],
         "provider_transcript_preserved": normalized["provider_transcript_preserved"],
+        "provider_summary_preserved": normalized["provider_summary_preserved"],
+        "provider_action_item_count": normalized["provider_action_item_count"],
         "provider_recording_ref_count": normalized["provider_recording_ref_count"],
     }
 

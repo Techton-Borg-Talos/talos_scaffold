@@ -1,4 +1,9 @@
-"""modules/archive_export - preserve Dialpad event files to the shared archive."""
+"""Shared helpers for standalone Dialpad historical tools.
+
+This module is intentionally independent from the TALOS worker app so the
+historical backfill and catch-up email tools can run directly from a normal
+Windows virtualenv.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -8,24 +13,32 @@ import json
 import mimetypes
 import os
 import re
-import shlex
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
 try:
-    from worker_main import register
-except ModuleNotFoundError:
-    def register(job_type: str, module_name: str):  # type: ignore[misc]
-        def _wrap(fn):
-            return fn
-        return _wrap
+    from dotenv import load_dotenv
+except ModuleNotFoundError:  # pragma: no cover - optional during bootstrap
+    load_dotenv = None
 
-ARCHIVE_ROOT = Path(os.environ.get("DIALPAD_ARCHIVE_DIR", "/mnt/dialpad_archive"))
+SCRIPT_DIR = Path(__file__).resolve().parent
+if load_dotenv is not None:
+    load_dotenv(SCRIPT_DIR / ".env", override=False)
+
+ARCHIVE_ROOT = Path(
+    os.environ.get("DIALPAD_ARCHIVE_ROOT", r"Z:\Historical\Dialpad")
+).expanduser()
+DEFAULT_CONTACTS_CSV = Path(
+    os.environ.get(
+        "DIALPAD_CONTACTS_CSV",
+        r"Z:\Historical\Contacts\2026_0408_master_contacts_clean.csv",
+    )
+).expanduser()
 DEFAULT_OFFICE_MAP = {
     "4943523498434560": "INC",
 }
@@ -59,10 +72,6 @@ CATEGORY_MAP = {
 }
 ARCHIVE_TIMEZONE_NAME = os.environ.get("DIALPAD_ARCHIVE_TIMEZONE", "America/New_York").strip() or "America/New_York"
 STATS_TIMEZONE_NAME = os.environ.get("DIALPAD_STATS_TIMEZONE", ARCHIVE_TIMEZONE_NAME).strip() or "UTC"
-ARCHIVE_SYNC_MODE = os.environ.get("ARCHIVE_SYNC_MODE", "none").strip().lower()
-ARCHIVE_SYNC_RSYNC_DEST = os.environ.get("ARCHIVE_SYNC_RSYNC_DEST", "").strip()
-ARCHIVE_SYNC_SSH_KEY_PATH = os.environ.get("ARCHIVE_SYNC_SSH_KEY_PATH", "").strip()
-ARCHIVE_SYNC_SSH_OPTS = os.environ.get("ARCHIVE_SYNC_SSH_OPTS", "").strip()
 DIALPAD_CLIENT_ID = os.environ.get("DIALPAD_CLIENT_ID", "").strip()
 DIALPAD_CLIENT_SECRET = os.environ.get("DIALPAD_CLIENT_SECRET", "").strip()
 DIALPAD_REFRESH_TOKEN = os.environ.get("DIALPAD_REFRESH_TOKEN", "").strip()
@@ -187,82 +196,6 @@ def _write_json(path: Path, payload: Dict[str, Any]) -> int:
     return path.stat().st_size
 
 
-def _normalized_lookup_key(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
-
-
-def _iter_named_values(obj: Any, target_keys: Iterable[str]) -> Iterable[Any]:
-    normalized_targets = {_normalized_lookup_key(key) for key in target_keys}
-
-    def _walk(value: Any) -> Iterable[Any]:
-        if isinstance(value, dict):
-            for key, child in value.items():
-                if _normalized_lookup_key(key) in normalized_targets:
-                    yield child
-                yield from _walk(child)
-        elif isinstance(value, list):
-            for child in value:
-                yield from _walk(child)
-
-    yield from _walk(obj)
-
-
-def _clean_text_candidate(value: Any) -> Optional[str]:
-    if not isinstance(value, str):
-        return None
-    text = value.replace("\r\n", "\n").replace("\r", "\n").strip()
-    if not text:
-        return None
-    lowered = text.lower()
-    if lowered.startswith("http://") or lowered.startswith("https://"):
-        return None
-    return text
-
-
-def _first_text_candidate(obj: Any, target_keys: Iterable[str]) -> Optional[str]:
-    for value in _iter_named_values(obj, target_keys):
-        text = _clean_text_candidate(value)
-        if text:
-            return text
-    return None
-
-
-def _extract_action_items(obj: Any) -> List[str]:
-    action_items: List[str] = []
-    for value in _iter_named_values(obj, ("action_items", "actionItems", "next_steps", "tasks", "todos")):
-        if isinstance(value, str):
-            text = _clean_text_candidate(value)
-            if text:
-                action_items.append(text)
-            continue
-        if isinstance(value, list):
-            for item in value:
-                if isinstance(item, str):
-                    text = _clean_text_candidate(item)
-                    if text:
-                        action_items.append(text)
-                elif isinstance(item, dict):
-                    for candidate_key in ("text", "label", "title", "description", "body"):
-                        text = _clean_text_candidate(item.get(candidate_key))
-                        if text:
-                            action_items.append(text)
-                            break
-    deduped: List[str] = []
-    seen: set[str] = set()
-    for item in action_items:
-        if item in seen:
-            continue
-        seen.add(item)
-        deduped.append(item)
-    return deduped
-
-
-def _stringify_action_items(items: List[str]) -> Optional[str]:
-    if not items:
-        return None
-    return "\n".join(f"{index}. {item}" for index, item in enumerate(items, start=1))
-
-
 def _write_bytes(path: Path, content: bytes) -> int:
     path.write_bytes(content)
     return path.stat().st_size
@@ -385,22 +318,10 @@ def _infer_manifest_entry(
         metadata["file_role"] = "provider_transcript_csv"
         metadata["provider"] = "dialpad"
         content_type = "text/csv"
-    elif path.name.endswith("_provider_summary.txt"):
-        metadata["file_role"] = "provider_summary"
-        metadata["provider"] = "dialpad"
-        content_type = "text/plain"
-    elif path.name.endswith("_provider_action_items.txt"):
-        metadata["file_role"] = "provider_action_items"
-        metadata["provider"] = "dialpad"
-        content_type = "text/plain"
     elif path.name.endswith("_text.txt"):
         metadata["file_role"] = "sms_text"
         metadata["provider"] = "dialpad"
         content_type = "text/plain"
-    elif path.name.endswith("_call_detail.json"):
-        metadata["file_role"] = "call_detail"
-        metadata["provider"] = "dialpad"
-        content_type = "application/json"
     elif path.name.endswith("_recording_references.json"):
         metadata["file_role"] = "recording_references"
         content_type = "application/json"
@@ -705,62 +626,6 @@ def _call_id_for_payload(payload: Dict[str, Any]) -> str:
         or payload.get("external_id")
         or ""
     ).strip()
-
-
-def _provider_transcript_text(payload: Dict[str, Any], call_detail: Optional[Dict[str, Any]] = None) -> Optional[str]:
-    for candidate in (
-        payload.get("provider_transcript_text"),
-        payload.get("source_metadata") or {},
-        call_detail or {},
-    ):
-        text = _first_text_candidate(
-            candidate,
-            (
-                "transcription_text",
-                "transcript_text",
-                "transcript",
-                "transcription",
-                "full_transcript",
-            ),
-        )
-        if text:
-            return text
-    return None
-
-
-def _provider_summary_text(payload: Dict[str, Any], call_detail: Optional[Dict[str, Any]] = None) -> Optional[str]:
-    for candidate in (
-        payload.get("provider_summary_text"),
-        payload.get("source_metadata") or {},
-        call_detail or {},
-    ):
-        text = _first_text_candidate(
-            candidate,
-            (
-                "summary",
-                "ai_summary",
-                "call_summary",
-                "review_summary",
-                "conversation_summary",
-                "recap",
-            ),
-        )
-        if text:
-            return text
-    return None
-
-
-def _provider_action_items(payload: Dict[str, Any], call_detail: Optional[Dict[str, Any]] = None) -> List[str]:
-    combined: List[str] = []
-    for candidate in (
-        payload.get("provider_action_items") or [],
-        payload.get("source_metadata") or {},
-        call_detail or {},
-    ):
-        for item in _extract_action_items(candidate):
-            if item not in combined:
-                combined.append(item)
-    return combined
 
 
 def _archive_lock_key(payload: Dict[str, Any]) -> str:
@@ -1245,39 +1110,6 @@ def _existing_audio_entry(
     return None
 
 
-async def _sync_archive_dir(archive_dir: Path) -> Optional[Dict[str, Any]]:
-    if ARCHIVE_SYNC_MODE != "rsync" or not ARCHIVE_SYNC_RSYNC_DEST:
-        return None
-
-    relative_dir = archive_dir.relative_to(ARCHIVE_ROOT).as_posix()
-    remote_dest = f"{ARCHIVE_SYNC_RSYNC_DEST.rstrip('/')}/{relative_dir}/"
-    cmd = ["rsync", "-az"]
-
-    ssh_parts: List[str] = []
-    if ARCHIVE_SYNC_SSH_KEY_PATH:
-        ssh_parts.extend(["-i", ARCHIVE_SYNC_SSH_KEY_PATH])
-    if ARCHIVE_SYNC_SSH_OPTS:
-        ssh_parts.extend(shlex.split(ARCHIVE_SYNC_SSH_OPTS))
-    if ssh_parts:
-        cmd.extend(["-e", "ssh " + " ".join(shlex.quote(part) for part in ssh_parts)])
-
-    cmd.extend([f"{archive_dir.as_posix()}/", remote_dest])
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-    return {
-        "mode": "rsync",
-        "destination": remote_dest,
-        "ok": proc.returncode == 0,
-        "exit_code": proc.returncode,
-        "stdout": stdout.decode("utf-8", errors="replace").strip(),
-        "stderr": stderr.decode("utf-8", errors="replace").strip(),
-    }
-
-
 async def _download_recordings(
     payload: Dict[str, Any],
     archive_dir: Path,
@@ -1434,7 +1266,6 @@ async def _download_recordings(
     return manifests, results
 
 
-@register("ARCHIVE_EXPORT", "archive_export")
 async def handle_archive_export(job: Dict[str, Any]) -> Dict[str, Any]:
     payload = job.get("payload") or {}
     async with _archive_lock_for(payload):
@@ -1482,8 +1313,6 @@ async def handle_archive_export(job: Dict[str, Any]) -> Dict[str, Any]:
             "source_provenance": source_provenance,
             "company_slug": company_slug,
             "recording_references": payload.get("recording_references") or [],
-            "provider_summary_text": payload.get("provider_summary_text"),
-            "provider_action_items": payload.get("provider_action_items") or [],
         }
         metadata_path = archive_dir / f"{event_stem}_metadata.json"
         metadata_size = _write_json(metadata_path, metadata_payload)
@@ -1515,27 +1344,7 @@ async def handle_archive_export(job: Dict[str, Any]) -> Dict[str, Any]:
                 )
             )
 
-        call_detail: Dict[str, Any] = {}
-        call_id = _call_id_for_payload(payload)
-        if call_id and (DIALPAD_ACCESS_TOKEN or DIALPAD_REFRESH_TOKEN):
-            call_detail = await _fetch_call_detail(call_id)
-        if call_detail:
-            call_detail_path = archive_dir / f"{event_stem}_call_detail.json"
-            call_detail_size = _write_json(call_detail_path, call_detail)
-            manifest.append(
-                _manifest_entry(
-                    call_detail_path,
-                    "application/json",
-                    {
-                        **common_meta,
-                        "file_role": "call_detail",
-                        "provider": "dialpad",
-                    },
-                    call_detail_size,
-                )
-            )
-
-        provider_transcript_text = _provider_transcript_text(payload, call_detail)
+        provider_transcript_text = payload.get("provider_transcript_text")
         if isinstance(provider_transcript_text, str) and provider_transcript_text.strip():
             transcript_path = archive_dir / f"{event_stem}_provider_transcript.txt"
             transcript_size = _write_text(transcript_path, provider_transcript_text)
@@ -1563,41 +1372,6 @@ async def handle_archive_export(job: Dict[str, Any]) -> Dict[str, Any]:
                         "provider": "dialpad",
                     },
                     transcript_csv_size,
-                )
-            )
-
-        provider_summary_text = _provider_summary_text(payload, call_detail)
-        if isinstance(provider_summary_text, str) and provider_summary_text.strip():
-            summary_path = archive_dir / f"{event_stem}_provider_summary.txt"
-            summary_size = _write_text(summary_path, provider_summary_text)
-            manifest.append(
-                _manifest_entry(
-                    summary_path,
-                    "text/plain",
-                    {
-                        **common_meta,
-                        "file_role": "provider_summary",
-                        "provider": "dialpad",
-                    },
-                    summary_size,
-                )
-            )
-
-        provider_action_items = _provider_action_items(payload, call_detail)
-        provider_action_items_text = _stringify_action_items(provider_action_items)
-        if provider_action_items_text:
-            action_items_path = archive_dir / f"{event_stem}_provider_action_items.txt"
-            action_items_size = _write_text(action_items_path, provider_action_items_text)
-            manifest.append(
-                _manifest_entry(
-                    action_items_path,
-                    "text/plain",
-                    {
-                        **common_meta,
-                        "file_role": "provider_action_items",
-                        "provider": "dialpad",
-                    },
-                    action_items_size,
                 )
             )
 
@@ -1661,18 +1435,13 @@ async def handle_archive_export(job: Dict[str, Any]) -> Dict[str, Any]:
         )
         final_manifest = _merge_manifest_entries(merged_manifest, [manifest_entry])
 
-        sync_result = await _sync_archive_dir(archive_dir)
-
         return {
             "job_uuid": job.get("job_uuid"),
             "event_uuid": event_uuid,
             "archive_dir": str(archive_dir),
             "archive_files": final_manifest,
             "provider_transcript_preserved": bool(provider_transcript_text),
-            "provider_summary_preserved": bool(provider_summary_text),
-            "provider_action_item_count": len(provider_action_items),
             "sms_text_preserved": bool(sms_text),
             "recording_reference_count": len(recording_references or []),
             "audio_downloads": audio_results,
-            "archive_sync": sync_result,
         }
