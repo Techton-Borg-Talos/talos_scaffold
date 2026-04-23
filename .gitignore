@@ -46,6 +46,7 @@ worker/local/work/
 worker/local/models/
 worker/local/output/
 worker/local/tmp/
+tmp/
 
 # Credentials / tokens
 gmail_token.json
