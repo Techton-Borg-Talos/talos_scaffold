@@ -470,20 +470,97 @@ async def _dialpad_request(
 
 
 def _dedupe_candidates(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    deduped: List[Dict[str, Any]] = []
-    seen: set[tuple[str, str, str, str]] = set()
-    for candidate in candidates:
-        key = (
-            str(candidate.get("url") or ""),
-            str(candidate.get("recording_id") or ""),
-            str(candidate.get("recording_type") or ""),
-            str(candidate.get("source") or ""),
+    preferred_source_rank = {
+        "call_detail_recording_details": 0,
+        "recording_detail_url": 1,
+        "stats_recordings": 2,
+        "stats_voicemails": 2,
+        "recording_details": 3,
+        "call_detail_direct": 4,
+        "call_detail_admin_recording_urls": 5,
+        "call_detail_admin_call_recording_share_links": 5,
+        "call_detail_call_recording_share_links": 5,
+        "source_metadata_recording_url": 6,
+        "source_metadata_voicemail_link": 6,
+        "source_metadata_admin_recording_urls": 7,
+        "dialpad_v_fallback": 9,
+    }
+
+    def _recording_id_from_url(url: str) -> str:
+        match = re.search(
+            r"/blob/(?:adminrecording|callrecording|voicemail(?:_recording)?)/(\d+)(?:\.[A-Za-z0-9]+)?(?:$|[?#])",
+            url,
+            re.IGNORECASE,
         )
-        if key in seen:
+        return match.group(1) if match else ""
+
+    def _normalized_source_url(url: str) -> str:
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            return ""
+        canonical_id = _recording_id_from_url(url)
+        if canonical_id:
+            recording_type = "callrecording"
+            lowered_path = parsed.path.lower()
+            if "adminrecording" in lowered_path:
+                recording_type = "admincallrecording"
+            elif "voicemail" in lowered_path:
+                recording_type = "voicemail"
+            return f"{parsed.netloc.lower()}:{recording_type}:{canonical_id}"
+        return f"{parsed.netloc.lower()}{parsed.path}"
+
+    def _candidate_recording_id(candidate: Dict[str, Any]) -> str:
+        explicit = str(candidate.get("recording_id") or "").strip()
+        if explicit:
+            return explicit
+        return _recording_id_from_url(str(candidate.get("url") or "").strip())
+
+    def _candidate_identity_key(candidate: Dict[str, Any]) -> tuple[str, str, str]:
+        recording_type = str(candidate.get("recording_type") or "").strip()
+        recording_id = _candidate_recording_id(candidate)
+        if recording_id:
+            return ("recording", recording_type, recording_id)
+        normalized_url = _normalized_source_url(str(candidate.get("url") or "").strip())
+        return ("url", recording_type, normalized_url)
+
+    def _candidate_rank(candidate: Dict[str, Any]) -> tuple[int, int, int]:
+        source = str(candidate.get("source") or "").strip()
+        rank = preferred_source_rank.get(source, 50)
+        has_recording_id = 0 if _candidate_recording_id(candidate) else 1
+        has_duration = 0 if candidate.get("duration_ms") not in (None, "", 0, 0.0) else 1
+        return (rank, has_recording_id, has_duration)
+
+    candidates = [dict(candidate) for candidate in candidates]
+
+    unique_ids_by_type: Dict[str, set[str]] = {}
+    for candidate in candidates:
+        recording_type = str(candidate.get("recording_type") or "").strip()
+        recording_id = _candidate_recording_id(candidate)
+        if recording_type and recording_id:
+            unique_ids_by_type.setdefault(recording_type, set()).add(recording_id)
+
+    for candidate in candidates:
+        if _candidate_recording_id(candidate):
+            candidate["recording_id"] = _candidate_recording_id(candidate)
             continue
-        seen.add(key)
-        deduped.append(candidate)
-    return deduped
+        recording_type = str(candidate.get("recording_type") or "").strip()
+        type_ids = unique_ids_by_type.get(recording_type) or set()
+        if len(type_ids) == 1:
+            candidate["recording_id"] = next(iter(type_ids))
+
+    deduped_by_key: Dict[tuple[str, str, str], Dict[str, Any]] = {}
+    ordered_keys: List[tuple[str, str, str]] = []
+    for candidate in candidates:
+        key = _candidate_identity_key(candidate)
+        existing = deduped_by_key.get(key)
+        if existing is None:
+            deduped_by_key[key] = candidate
+            ordered_keys.append(key)
+            continue
+        if _candidate_rank(candidate) < _candidate_rank(existing):
+            deduped_by_key[key] = candidate
+
+    return [deduped_by_key[key] for key in ordered_keys]
 
 
 def _call_id_for_payload(payload: Dict[str, Any]) -> str:
@@ -936,14 +1013,37 @@ def _existing_audio_entry(
     candidate: Dict[str, Any],
     resolved_url: str,
 ) -> Optional[Dict[str, Any]]:
-    candidate_recording_id = str(candidate.get("recording_id") or "").strip()
-    candidate_source = str(resolved_url or "").strip()
+    def _recording_id_from_url(url: str) -> str:
+        match = re.search(
+            r"/blob/(?:adminrecording|callrecording|voicemail(?:_recording)?)/(\d+)(?:\.[A-Za-z0-9]+)?(?:$|[?#])",
+            url,
+            re.IGNORECASE,
+        )
+        return match.group(1) if match else ""
+
+    def _normalized_source_url(url: str) -> str:
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            return ""
+        canonical_id = _recording_id_from_url(url)
+        if canonical_id:
+            recording_type = "callrecording"
+            lowered_path = parsed.path.lower()
+            if "adminrecording" in lowered_path:
+                recording_type = "admincallrecording"
+            elif "voicemail" in lowered_path:
+                recording_type = "voicemail"
+            return f"{parsed.netloc.lower()}:{recording_type}:{canonical_id}"
+        return f"{parsed.netloc.lower()}{parsed.path}"
+
+    candidate_recording_id = str(candidate.get("recording_id") or "").strip() or _recording_id_from_url(str(candidate.get("url") or "").strip()) or _recording_id_from_url(str(resolved_url or "").strip())
+    candidate_source = _normalized_source_url(str(resolved_url or "").strip())
     for entry in manifest_entries:
         metadata = entry.get("metadata") or {}
         if metadata.get("file_role") != "provider_audio":
             continue
         existing_recording_id = str(metadata.get("recording_id") or "").strip()
-        existing_source = str(metadata.get("source_url") or "").strip()
+        existing_source = _normalized_source_url(str(metadata.get("source_url") or "").strip())
         if candidate_recording_id and existing_recording_id == candidate_recording_id:
             return entry
         if candidate_source and existing_source == candidate_source:
@@ -991,6 +1091,29 @@ async def _download_recordings(
     common_meta: Dict[str, Any],
     existing_manifest_entries: List[Dict[str, Any]],
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    def _recording_id_from_url(url: str) -> str:
+        match = re.search(
+            r"/blob/(?:adminrecording|callrecording|voicemail(?:_recording)?)/(\d+)(?:\.[A-Za-z0-9]+)?(?:$|[?#])",
+            url,
+            re.IGNORECASE,
+        )
+        return match.group(1) if match else ""
+
+    def _normalized_source_url(url: str) -> str:
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            return ""
+        canonical_id = _recording_id_from_url(url)
+        if canonical_id:
+            recording_type = "callrecording"
+            lowered_path = parsed.path.lower()
+            if "adminrecording" in lowered_path:
+                recording_type = "admincallrecording"
+            elif "voicemail" in lowered_path:
+                recording_type = "voicemail"
+            return f"{parsed.netloc.lower()}:{recording_type}:{canonical_id}"
+        return f"{parsed.netloc.lower()}{parsed.path}"
+
     manifests: List[Dict[str, Any]] = []
     results: List[Dict[str, Any]] = []
     candidates = await _resolve_payload_recordings(payload)
@@ -1012,7 +1135,8 @@ async def _download_recordings(
                 )
                 continue
 
-            dedupe_key = str(candidate.get("recording_id") or "").strip() or resolved_url
+            candidate_recording_id = str(candidate.get("recording_id") or "").strip() or _recording_id_from_url(str(candidate.get("url") or "").strip()) or _recording_id_from_url(str(resolved_url or "").strip())
+            dedupe_key = candidate_recording_id or _normalized_source_url(str(resolved_url or "").strip())
             if dedupe_key in seen_download_keys:
                 results.append(
                     {
@@ -1057,10 +1181,11 @@ async def _download_recordings(
                         **common_meta,
                         "file_role": "provider_audio",
                         "provider": "dialpad",
-                        "recording_id": candidate.get("recording_id"),
+                        "recording_id": candidate_recording_id or candidate.get("recording_id"),
                         "recording_type": candidate.get("recording_type"),
                         "duration_ms": candidate.get("duration_ms"),
-                        "source_url": final_url,
+                        "source_url": resolved_url,
+                        "source_url_final": final_url,
                         "source": candidate.get("source"),
                     },
                     byte_size,
