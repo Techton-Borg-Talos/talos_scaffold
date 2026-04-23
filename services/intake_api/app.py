@@ -504,7 +504,6 @@ def _archive_payload_signature(archive_payload: Dict) -> str:
                 str(item.get("recording_id") or ""),
             ),
         ),
-        "source_state": source_metadata.get("state"),
         "voicemail_recording_id": source_metadata.get("voicemail_recording_id"),
         "call_recording_ids": sorted(str(item) for item in (source_metadata.get("call_recording_ids") or [])),
     }

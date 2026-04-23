@@ -70,6 +70,7 @@ DIALPAD_COMPANY_ID = os.environ.get("DIALPAD_COMPANY_ID", "").strip()
 _dialpad_token_lock = asyncio.Lock()
 _dialpad_access_token = DIALPAD_ACCESS_TOKEN
 _dialpad_refresh_token = DIALPAD_REFRESH_TOKEN
+_archive_locks: Dict[str, asyncio.Lock] = {}
 
 
 def _safe_component(value: Optional[str], fallback: str) -> str:
@@ -494,6 +495,26 @@ def _call_id_for_payload(payload: Dict[str, Any]) -> str:
         or payload.get("external_id")
         or ""
     ).strip()
+
+
+def _archive_lock_key(payload: Dict[str, Any]) -> str:
+    event_uuid = str(payload.get("event_uuid") or "").strip()
+    external_id = str(payload.get("external_id") or "").strip()
+    phone_bucket = _safe_component(
+        _conversation_number(payload.get("source_provenance") or {}),
+        "unknown_number",
+    )
+    channel = _archive_channel(payload)
+    return event_uuid or f"{channel}:{phone_bucket}:{external_id or 'unknown'}"
+
+
+def _archive_lock_for(payload: Dict[str, Any]) -> asyncio.Lock:
+    key = _archive_lock_key(payload)
+    lock = _archive_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _archive_locks[key] = lock
+    return lock
 
 
 def _stats_target_candidates(payload: Dict[str, Any]) -> List[tuple[str, str]]:
@@ -973,6 +994,7 @@ async def _download_recordings(
     manifests: List[Dict[str, Any]] = []
     results: List[Dict[str, Any]] = []
     candidates = await _resolve_payload_recordings(payload)
+    seen_download_keys: set[str] = set()
 
     for index, candidate in enumerate(candidates, start=1):
         try:
@@ -990,8 +1012,22 @@ async def _download_recordings(
                 )
                 continue
 
+            dedupe_key = str(candidate.get("recording_id") or "").strip() or resolved_url
+            if dedupe_key in seen_download_keys:
+                results.append(
+                    {
+                        "index": index,
+                        "status": "duplicate_candidate",
+                        "recording_id": candidate.get("recording_id"),
+                        "recording_type": candidate.get("recording_type"),
+                        "source_url": resolved_url,
+                    }
+                )
+                continue
+
             existing_entry = _existing_audio_entry(existing_manifest_entries, candidate, resolved_url)
             if existing_entry is not None:
+                seen_download_keys.add(dedupe_key)
                 results.append(
                     {
                         "index": index,
@@ -1030,6 +1066,8 @@ async def _download_recordings(
                     byte_size,
                 )
             )
+            existing_manifest_entries.append(manifests[-1])
+            seen_download_keys.add(dedupe_key)
             results.append(
                 {
                     "index": index,
@@ -1059,168 +1097,169 @@ async def _download_recordings(
 @register("ARCHIVE_EXPORT", "archive_export")
 async def handle_archive_export(job: Dict[str, Any]) -> Dict[str, Any]:
     payload = job.get("payload") or {}
-    event_uuid = str(job.get("event_uuid") or payload.get("event_uuid") or "")
-    channel = _archive_channel(payload)
-    occurred_at = _parse_occurred_at(payload.get("occurred_at"))
-    source_provenance = payload.get("source_provenance") or {}
-    company_slug = _company_slug(source_provenance)
-    phone_bucket = _safe_component(_conversation_number(source_provenance), "unknown_number")
-    external_id = str(payload.get("external_id") or "")
-    phone_channel_root = ARCHIVE_ROOT / phone_bucket / _channel_dir(channel)
-    existing_archive_dir = _find_existing_archive_dir(phone_channel_root, event_uuid, external_id)
-    event_stem = (
-        _existing_event_stem(existing_archive_dir)
-        if existing_archive_dir is not None
-        else _safe_component(
-            _event_stem(phone_bucket, channel, occurred_at, source_provenance),
-            "unknown_event",
+    async with _archive_lock_for(payload):
+        event_uuid = str(job.get("event_uuid") or payload.get("event_uuid") or "")
+        channel = _archive_channel(payload)
+        occurred_at = _parse_occurred_at(payload.get("occurred_at"))
+        source_provenance = payload.get("source_provenance") or {}
+        company_slug = _company_slug(source_provenance)
+        phone_bucket = _safe_component(_conversation_number(source_provenance), "unknown_number")
+        external_id = str(payload.get("external_id") or "")
+        phone_channel_root = ARCHIVE_ROOT / phone_bucket / _channel_dir(channel)
+        existing_archive_dir = _find_existing_archive_dir(phone_channel_root, event_uuid, external_id)
+        event_stem = (
+            _existing_event_stem(existing_archive_dir)
+            if existing_archive_dir is not None
+            else _safe_component(
+                _event_stem(phone_bucket, channel, occurred_at, source_provenance),
+                "unknown_event",
+            )
         )
-    )
 
-    archive_dir = existing_archive_dir or (phone_channel_root / event_stem)
-    archive_dir.mkdir(parents=True, exist_ok=True)
+        archive_dir = existing_archive_dir or (phone_channel_root / event_stem)
+        archive_dir.mkdir(parents=True, exist_ok=True)
 
-    manifest: List[Dict[str, Any]] = []
-    common_meta = {
-        "event_uuid": event_uuid,
-        "channel": channel,
-        "phone_bucket": phone_bucket,
-        "event_stem": event_stem,
-        "company_slug": company_slug,
-    }
-    existing_manifest = _load_manifest_entries(archive_dir, event_stem)
-    if not existing_manifest:
-        existing_manifest = _rebuild_manifest_entries(archive_dir, event_stem, common_meta)
+        manifest: List[Dict[str, Any]] = []
+        common_meta = {
+            "event_uuid": event_uuid,
+            "channel": channel,
+            "phone_bucket": phone_bucket,
+            "event_stem": event_stem,
+            "company_slug": company_slug,
+        }
+        existing_manifest = _load_manifest_entries(archive_dir, event_stem)
+        if not existing_manifest:
+            existing_manifest = _rebuild_manifest_entries(archive_dir, event_stem, common_meta)
 
-    metadata_payload = {
-        "event_uuid": event_uuid,
-        "external_id": payload.get("external_id"),
-        "channel": channel,
-        "subject": payload.get("subject"),
-        "occurred_at": payload.get("occurred_at"),
-        "event_stem": event_stem,
-        "archive_timezone": ARCHIVE_TIMEZONE_NAME,
-        "source_provenance": source_provenance,
-        "company_slug": company_slug,
-        "recording_references": payload.get("recording_references") or [],
-    }
-    metadata_path = archive_dir / f"{event_stem}_metadata.json"
-    metadata_size = _write_json(metadata_path, metadata_payload)
-    manifest.append(
-        _manifest_entry(
-            metadata_path,
+        metadata_payload = {
+            "event_uuid": event_uuid,
+            "external_id": payload.get("external_id"),
+            "channel": channel,
+            "subject": payload.get("subject"),
+            "occurred_at": payload.get("occurred_at"),
+            "event_stem": event_stem,
+            "archive_timezone": ARCHIVE_TIMEZONE_NAME,
+            "source_provenance": source_provenance,
+            "company_slug": company_slug,
+            "recording_references": payload.get("recording_references") or [],
+        }
+        metadata_path = archive_dir / f"{event_stem}_metadata.json"
+        metadata_size = _write_json(metadata_path, metadata_payload)
+        manifest.append(
+            _manifest_entry(
+                metadata_path,
+                "application/json",
+                {
+                    **common_meta,
+                    "file_role": "metadata",
+                },
+                metadata_size,
+            )
+        )
+
+        event_payload = payload.get("source_metadata")
+        if isinstance(event_payload, dict):
+            event_path = archive_dir / f"{event_stem}_event.json"
+            event_size = _write_json(event_path, event_payload)
+            manifest.append(
+                _manifest_entry(
+                    event_path,
+                    "application/json",
+                    {
+                        **common_meta,
+                        "file_role": "event_source_metadata",
+                    },
+                    event_size,
+                )
+            )
+
+        provider_transcript_text = payload.get("provider_transcript_text")
+        if isinstance(provider_transcript_text, str) and provider_transcript_text.strip():
+            transcript_path = archive_dir / f"{event_stem}_provider_transcript.txt"
+            transcript_size = _write_text(transcript_path, provider_transcript_text)
+            manifest.append(
+                _manifest_entry(
+                    transcript_path,
+                    "text/plain",
+                    {
+                        **common_meta,
+                        "file_role": "provider_transcript",
+                        "provider": "dialpad",
+                    },
+                    transcript_size,
+                )
+            )
+
+        sms_text = payload.get("sms_text")
+        if isinstance(sms_text, str) and sms_text.strip():
+            sms_path = archive_dir / f"{event_stem}_text.txt"
+            sms_size = _write_text(sms_path, sms_text)
+            manifest.append(
+                _manifest_entry(
+                    sms_path,
+                    "text/plain",
+                    {
+                        **common_meta,
+                        "file_role": "sms_text",
+                        "provider": "dialpad",
+                    },
+                    sms_size,
+                )
+            )
+
+        recording_references = payload.get("recording_references")
+        if isinstance(recording_references, list) and recording_references:
+            refs_path = archive_dir / f"{event_stem}_recording_references.json"
+            refs_size = _write_json(refs_path, {"recording_references": recording_references})
+            manifest.append(
+                _manifest_entry(
+                    refs_path,
+                    "application/json",
+                    {
+                        **common_meta,
+                        "file_role": "recording_references",
+                    },
+                    refs_size,
+                )
+            )
+
+        audio_manifests, audio_results = await _download_recordings(
+            payload,
+            archive_dir,
+            event_stem,
+            common_meta,
+            existing_manifest,
+        )
+        manifest.extend(audio_manifests)
+
+        merged_manifest = _merge_manifest_entries(existing_manifest, manifest)
+        manifest_path = _manifest_path(archive_dir, event_stem)
+        manifest_payload = {
+            "event_uuid": event_uuid,
+            "archive_files": merged_manifest,
+        }
+        manifest_size = _write_json(manifest_path, manifest_payload)
+        manifest_entry = _manifest_entry(
+            manifest_path,
             "application/json",
             {
                 **common_meta,
-                "file_role": "metadata",
+                "file_role": "archive_manifest",
             },
-            metadata_size,
+            manifest_size,
         )
-    )
+        final_manifest = _merge_manifest_entries(merged_manifest, [manifest_entry])
 
-    event_payload = payload.get("source_metadata")
-    if isinstance(event_payload, dict):
-        event_path = archive_dir / f"{event_stem}_event.json"
-        event_size = _write_json(event_path, event_payload)
-        manifest.append(
-            _manifest_entry(
-                event_path,
-                "application/json",
-                {
-                    **common_meta,
-                    "file_role": "event_source_metadata",
-                },
-                event_size,
-            )
-        )
+        sync_result = await _sync_archive_dir(archive_dir)
 
-    provider_transcript_text = payload.get("provider_transcript_text")
-    if isinstance(provider_transcript_text, str) and provider_transcript_text.strip():
-        transcript_path = archive_dir / f"{event_stem}_provider_transcript.txt"
-        transcript_size = _write_text(transcript_path, provider_transcript_text)
-        manifest.append(
-            _manifest_entry(
-                transcript_path,
-                "text/plain",
-                {
-                    **common_meta,
-                    "file_role": "provider_transcript",
-                    "provider": "dialpad",
-                },
-                transcript_size,
-            )
-        )
-
-    sms_text = payload.get("sms_text")
-    if isinstance(sms_text, str) and sms_text.strip():
-        sms_path = archive_dir / f"{event_stem}_text.txt"
-        sms_size = _write_text(sms_path, sms_text)
-        manifest.append(
-            _manifest_entry(
-                sms_path,
-                "text/plain",
-                {
-                    **common_meta,
-                    "file_role": "sms_text",
-                    "provider": "dialpad",
-                },
-                sms_size,
-            )
-        )
-
-    recording_references = payload.get("recording_references")
-    if isinstance(recording_references, list) and recording_references:
-        refs_path = archive_dir / f"{event_stem}_recording_references.json"
-        refs_size = _write_json(refs_path, {"recording_references": recording_references})
-        manifest.append(
-            _manifest_entry(
-                refs_path,
-                "application/json",
-                {
-                    **common_meta,
-                    "file_role": "recording_references",
-                },
-                refs_size,
-            )
-        )
-
-    audio_manifests, audio_results = await _download_recordings(
-        payload,
-        archive_dir,
-        event_stem,
-        common_meta,
-        existing_manifest,
-    )
-    manifest.extend(audio_manifests)
-
-    merged_manifest = _merge_manifest_entries(existing_manifest, manifest)
-    manifest_path = _manifest_path(archive_dir, event_stem)
-    manifest_payload = {
-        "event_uuid": event_uuid,
-        "archive_files": merged_manifest,
-    }
-    manifest_size = _write_json(manifest_path, manifest_payload)
-    manifest_entry = _manifest_entry(
-        manifest_path,
-        "application/json",
-        {
-            **common_meta,
-            "file_role": "archive_manifest",
-        },
-        manifest_size,
-    )
-    final_manifest = _merge_manifest_entries(merged_manifest, [manifest_entry])
-
-    sync_result = await _sync_archive_dir(archive_dir)
-
-    return {
-        "job_uuid": job.get("job_uuid"),
-        "event_uuid": event_uuid,
-        "archive_dir": str(archive_dir),
-        "archive_files": final_manifest,
-        "provider_transcript_preserved": bool(provider_transcript_text),
-        "sms_text_preserved": bool(sms_text),
-        "recording_reference_count": len(recording_references or []),
-        "audio_downloads": audio_results,
-        "archive_sync": sync_result,
-    }
+        return {
+            "job_uuid": job.get("job_uuid"),
+            "event_uuid": event_uuid,
+            "archive_dir": str(archive_dir),
+            "archive_files": final_manifest,
+            "provider_transcript_preserved": bool(provider_transcript_text),
+            "sms_text_preserved": bool(sms_text),
+            "recording_reference_count": len(recording_references or []),
+            "audio_downloads": audio_results,
+            "archive_sync": sync_result,
+        }
