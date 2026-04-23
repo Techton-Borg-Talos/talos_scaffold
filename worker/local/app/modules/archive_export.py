@@ -1118,6 +1118,7 @@ async def _download_recordings(
     results: List[Dict[str, Any]] = []
     candidates = await _resolve_payload_recordings(payload)
     seen_download_keys: set[str] = set()
+    saved_audio_infos: List[Dict[str, Any]] = []
 
     for index, candidate in enumerate(candidates, start=1):
         try:
@@ -1167,10 +1168,21 @@ async def _download_recordings(
             content, content_type, final_url = await _download_audio_file(resolved_url)
             extension = _guess_audio_extension(content_type, final_url)
             duration_suffix = _duration_suffix(candidate.get("duration_ms"))
-            if len(candidates) == 1:
+            sequence_no = len(saved_audio_infos) + 1
+            if sequence_no == 1:
                 filename = f"{event_stem}_{duration_suffix}{extension}"
             else:
-                filename = f"{event_stem}_part{index:02d}_{duration_suffix}{extension}"
+                if sequence_no == 2:
+                    first_audio = saved_audio_infos[0]
+                    first_part_path = archive_dir / (
+                        f"{event_stem}_part01_{first_audio['duration_suffix']}{first_audio['extension']}"
+                    )
+                    if first_audio["path"] != first_part_path:
+                        first_audio["path"].replace(first_part_path)
+                        manifests[first_audio["manifest_index"]]["storage_uri"] = str(first_part_path)
+                        results[first_audio["result_index"]]["path"] = str(first_part_path)
+                        first_audio["path"] = first_part_path
+                filename = f"{event_stem}_part{sequence_no:02d}_{duration_suffix}{extension}"
             audio_path = archive_dir / filename
             byte_size = _write_bytes(audio_path, content)
             manifests.append(
@@ -1190,6 +1202,15 @@ async def _download_recordings(
                     },
                     byte_size,
                 )
+            )
+            saved_audio_infos.append(
+                {
+                    "path": audio_path,
+                    "duration_suffix": duration_suffix,
+                    "extension": extension,
+                    "manifest_index": len(manifests) - 1,
+                    "result_index": len(results),
+                }
             )
             existing_manifest_entries.append(manifests[-1])
             seen_download_keys.add(dedupe_key)
