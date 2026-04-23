@@ -140,6 +140,20 @@ def _write_text(path: Path, text: str) -> int:
     return path.stat().st_size
 
 
+def _write_transcript_csv(path: Path, text: str) -> int:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    rows = [row.strip() for row in normalized.split("\n") if row.strip()]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["line_number", "text"])
+        if rows:
+            for index, row in enumerate(rows, start=1):
+                writer.writerow([index, row])
+        else:
+            writer.writerow([1, normalized])
+    return path.stat().st_size
+
+
 def _write_json(path: Path, payload: Dict[str, Any]) -> int:
     rendered = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
     path.write_text(rendered, encoding="utf-8")
@@ -264,6 +278,10 @@ def _infer_manifest_entry(
         metadata["file_role"] = "provider_transcript"
         metadata["provider"] = "dialpad"
         content_type = "text/plain"
+    elif path.name.endswith("_provider_transcript.csv"):
+        metadata["file_role"] = "provider_transcript_csv"
+        metadata["provider"] = "dialpad"
+        content_type = "text/csv"
     elif path.name.endswith("_text.txt"):
         metadata["file_role"] = "sms_text"
         metadata["provider"] = "dialpad"
@@ -1333,6 +1351,20 @@ async def handle_archive_export(job: Dict[str, Any]) -> Dict[str, Any]:
                         "provider": "dialpad",
                     },
                     transcript_size,
+                )
+            )
+            transcript_csv_path = archive_dir / f"{event_stem}_provider_transcript.csv"
+            transcript_csv_size = _write_transcript_csv(transcript_csv_path, provider_transcript_text)
+            manifest.append(
+                _manifest_entry(
+                    transcript_csv_path,
+                    "text/csv",
+                    {
+                        **common_meta,
+                        "file_role": "provider_transcript_csv",
+                        "provider": "dialpad",
+                    },
+                    transcript_csv_size,
                 )
             )
 
