@@ -40,6 +40,11 @@ SUBJECT_PREFIX = os.environ.get("DIALPAD_CATCHUP_SUBJECT_PREFIX", "Dialpad Catch
 PHONE_FIELDS = ("primary_phone", "all_phones")
 NAME_FIELDS = ("full_name", "caller_name", "company")
 AUDIO_SUFFIXES = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".webm"}
+PLACEHOLDER_SUMMARIES = {
+    "dialpad historical call",
+    "dialpad historical sms",
+    "dialpad historical voicemail",
+}
 
 
 def _archive_timezone() -> timezone | ZoneInfo:
@@ -224,6 +229,68 @@ def _resolve_contact_display(
     return contact_phone or "Unknown contact"
 
 
+def _display_for_phone(
+    phone: Any,
+    contacts_index: Dict[str, Dict[str, str]],
+    *,
+    fallback_name: Optional[str] = None,
+) -> str:
+    normalized = _normalize_phone(phone)
+    if normalized:
+        matched = contacts_index.get(normalized)
+        if matched:
+            return f"{matched['display_name']} ({normalized})"
+    fallback = str(fallback_name or "").strip()
+    if fallback and normalized and fallback != normalized:
+        return f"{fallback} ({normalized})"
+    if normalized:
+        return normalized
+    return fallback or "Unknown"
+
+
+def _infer_sms_party_info(
+    source_provenance: Dict[str, Any],
+    source_metadata: Dict[str, Any],
+    contacts_index: Dict[str, Dict[str, str]],
+) -> Dict[str, str]:
+    contact = source_provenance.get("contact") or {}
+    target = source_provenance.get("target") or {}
+    direction = _event_direction(source_provenance)
+    from_phone = _normalize_phone(source_metadata.get("from_phone") or source_provenance.get("from_number"))
+    to_phone = _normalize_phone(source_metadata.get("to_phone") or source_provenance.get("internal_number"))
+    contact_phone = _normalize_phone(contact.get("phone") or source_provenance.get("external_number"))
+    target_phone = _normalize_phone(target.get("phone") or source_provenance.get("internal_number"))
+    source_name = str(source_metadata.get("name") or "").strip()
+    contact_name = str(contact.get("name") or "").strip()
+    target_name = str(target.get("name") or "").strip()
+
+    sender_fallback_name = source_name
+    recipient_fallback_name = target_name
+    if from_phone and contact_phone and from_phone == contact_phone and contact_name:
+        sender_fallback_name = contact_name or sender_fallback_name
+    if from_phone and target_phone and from_phone == target_phone and target_name:
+        sender_fallback_name = target_name or sender_fallback_name
+    if to_phone and target_phone and to_phone == target_phone and target_name:
+        recipient_fallback_name = target_name or recipient_fallback_name
+    if to_phone and contact_phone and to_phone == contact_phone and contact_name:
+        recipient_fallback_name = contact_name or recipient_fallback_name
+
+    sender_display = _display_for_phone(from_phone, contacts_index, fallback_name=sender_fallback_name)
+    recipient_display = _display_for_phone(to_phone, contacts_index, fallback_name=recipient_fallback_name)
+    if direction in {"outbound", "sent", "internal"}:
+        thread_key = to_phone or recipient_display
+        thread_display = recipient_display
+    else:
+        thread_key = from_phone or sender_display
+        thread_display = sender_display
+    return {
+        "sender_display": sender_display,
+        "recipient_display": recipient_display,
+        "thread_key": thread_key,
+        "thread_display": thread_display,
+    }
+
+
 def _event_direction(source_provenance: Dict[str, Any]) -> str:
     return str(source_provenance.get("direction") or "unknown").strip().lower() or "unknown"
 
@@ -340,6 +407,7 @@ def _event_record(
             ("summary", "ai_summary", "call_summary", "review_summary", "conversation_summary", "recap"),
         )
     action_items_text = _read_text(paths["action_items"]) if isinstance(paths.get("action_items"), Path) else None
+    sms_party_info = _infer_sms_party_info(source_provenance, source_metadata, contacts_index) if channel == "sms" else {}
 
     return {
         "channel": channel,
@@ -353,6 +421,10 @@ def _event_record(
         "source_provenance": source_provenance,
         "contact_display": _resolve_contact_display(source_provenance, source_metadata, contacts_index),
         "direction": _event_direction(source_provenance),
+        "sender_display": sms_party_info.get("sender_display"),
+        "recipient_display": sms_party_info.get("recipient_display"),
+        "sms_thread_key": sms_party_info.get("thread_key"),
+        "sms_thread_display": sms_party_info.get("thread_display"),
         "inline_text": inline_text,
         "summary_text": summary_text or _first_line(inline_text, fallback=str(metadata.get("subject") or "").strip()),
         "action_items_text": action_items_text,
@@ -564,24 +636,190 @@ def _event_call_id(event: Dict[str, Any]) -> str:
     return ""
 
 
+def _event_recording_urls(event: Dict[str, Any]) -> List[str]:
+    source_metadata = event["source_metadata"] if isinstance(event.get("source_metadata"), dict) else {}
+    urls: List[str] = []
+    for candidate in source_metadata.get("admin_recording_urls") or []:
+        text = str(candidate or "").strip()
+        if text.startswith("http"):
+            urls.append(text)
+    voicemail_link = str(source_metadata.get("voicemail_link") or "").strip()
+    if voicemail_link.startswith("http"):
+        urls.append(voicemail_link)
+    return urls
+
+
+def _event_attachment_urls(event: Dict[str, Any]) -> List[str]:
+    source_metadata = event["source_metadata"] if isinstance(event.get("source_metadata"), dict) else {}
+    urls: List[str] = []
+    for key in ("mms", "mms_url", "media_url", "attachment_url"):
+        text = str(source_metadata.get(key) or "").strip()
+        if text.startswith("http"):
+            urls.append(text)
+    media = source_metadata.get("media") or source_metadata.get("attachments") or []
+    if isinstance(media, list):
+        for item in media:
+            if isinstance(item, dict):
+                for key in ("url", "media_url", "attachment_url"):
+                    text = str(item.get(key) or "").strip()
+                    if text.startswith("http"):
+                        urls.append(text)
+            else:
+                text = str(item or "").strip()
+                if text.startswith("http"):
+                    urls.append(text)
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for url in urls:
+        if url in seen:
+            continue
+        seen.add(url)
+        deduped.append(url)
+    return deduped
+
+
+def _clean_summary_text(event: Dict[str, Any]) -> Optional[str]:
+    summary_text = str(event.get("summary_text") or "").strip()
+    if not summary_text:
+        return None
+    if summary_text.strip().lower() in PLACEHOLDER_SUMMARIES:
+        return None
+    return summary_text
+
+
+def _event_fallback_text(event: Dict[str, Any]) -> str:
+    channel = str(event.get("channel") or "").strip().lower()
+    source_metadata = event["source_metadata"] if isinstance(event.get("source_metadata"), dict) else {}
+    category = str(source_metadata.get("category") or "").strip().lower()
+    categories = str(source_metadata.get("categories") or "").strip().lower()
+    attachment_urls = _event_attachment_urls(event)
+    recording_urls = _event_recording_urls(event)
+    has_audio = bool(event.get("paths", {}).get("audio"))
+
+    if channel == "sms":
+        if attachment_urls:
+            return f"Attachment-only message archived: {attachment_urls[0]}"
+        return "Message text was not available in the historical export."
+
+    if channel == "voicemail":
+        if recording_urls or has_audio:
+            return "Transcript unavailable; voicemail recording was archived."
+        return "Transcript unavailable for this historical voicemail."
+
+    if channel == "call":
+        if any(token in {category, categories} for token in ("abandoned", "unanswered", "missed")) or any(
+            token in categories for token in ("abandoned", "unanswered", "missed")
+        ):
+            return "No transcript available; historical record shows an unanswered or abandoned call."
+        if recording_urls or has_audio:
+            return "Transcript unavailable; call recording was archived."
+        return "Transcript unavailable for this historical call."
+
+    return "Content not available."
+
+
+def _is_same_phone(left: Any, right: Any) -> bool:
+    normalized_left = _normalize_phone(left)
+    normalized_right = _normalize_phone(right)
+    return bool(normalized_left and normalized_right and normalized_left == normalized_right)
+
+
+def _should_hide_call_event(event: Dict[str, Any]) -> bool:
+    if str(event.get("channel") or "").strip().lower() != "call":
+        return False
+    if event.get("matching_voicemail_transcript"):
+        return True
+
+    source_metadata = event["source_metadata"] if isinstance(event.get("source_metadata"), dict) else {}
+    source_provenance = event["source_provenance"] if isinstance(event.get("source_provenance"), dict) else {}
+    category = str(source_metadata.get("category") or "").strip().lower()
+    categories = str(source_metadata.get("categories") or "").strip().lower()
+    if any(token in {category, categories} for token in ("abandoned", "unanswered", "missed")) or any(
+        token in categories for token in ("abandoned", "unanswered", "missed")
+    ):
+        return True
+
+    from_phone = source_metadata.get("from_phone") or source_provenance.get("from_number") or source_provenance.get("external_number")
+    to_phone = source_metadata.get("to_phone") or source_provenance.get("internal_number")
+    target = source_provenance.get("target") or {}
+    contact = source_provenance.get("contact") or {}
+    if _is_same_phone(from_phone, to_phone) or _is_same_phone(contact.get("phone"), target.get("phone")):
+        return True
+
+    return False
+
+
+def _sms_sender_display(event: Dict[str, Any]) -> str:
+    sender_display = str(event.get("sender_display") or "").strip()
+    return sender_display or event["contact_display"]
+
+
+def _sms_body_text(event: Dict[str, Any]) -> str:
+    inline_text = str(event.get("inline_text") or "").strip()
+    if inline_text.startswith("From: ") and "\nTo: " in inline_text:
+        parts = inline_text.split("\n\n", 1)
+        if len(parts) == 2:
+            body = parts[1].strip()
+            if body:
+                return body
+    if inline_text:
+        return inline_text
+    summary_text = _clean_summary_text(event)
+    if summary_text:
+        return summary_text
+    return _event_fallback_text(event)
+
+
+def _sms_thread_key(event: Dict[str, Any]) -> str:
+    return str(event.get("sms_thread_key") or "").strip() or event["contact_display"]
+
+
+def _sms_thread_title(events: List[Dict[str, Any]]) -> str:
+    first = events[0]
+    return str(first.get("sms_thread_display") or "").strip() or first["contact_display"]
+
+
+def _sms_thread_block(index: int, events: List[Dict[str, Any]]) -> str:
+    first = events[0]
+    start_time = first["occurred_at"].strftime("%I:%M:%S %p")
+    end_time = events[-1]["occurred_at"].strftime("%I:%M:%S %p")
+    lines = [
+        f"{index}. {_sms_thread_title(events)}",
+        f"Messages: {len(events)}",
+        f"Time range: {start_time}" if start_time == end_time else f"Time range: {start_time} -> {end_time}",
+        "Thread:",
+    ]
+    for event in events:
+        timestamp = event["occurred_at"].strftime("%I:%M:%S %p")
+        sender = _sms_sender_display(event)
+        body = _sms_body_text(event)
+        body_lines = [line.rstrip() for line in body.splitlines()] or [body]
+        lines.append(f"[{timestamp}] {sender}: {body_lines[0]}")
+        for extra_line in body_lines[1:]:
+            lines.append(f"  {extra_line}")
+    return "\n".join(lines)
+
+
 def _event_block(index: int, event: Dict[str, Any]) -> str:
     occurred_at = event["occurred_at"].strftime("%I:%M:%S %p")
     event_type = _event_label(event["channel"])
     duration = _event_duration(event)
+    inline_text = str(event.get("inline_text") or "").strip()
+    inline_has_explicit_from_to = inline_text.startswith("From: ") and "\nTo: " in inline_text
     lines = [
         f"{index}. {event['contact_display']}",
         f"Time: {occurred_at}",
         f"Event: {event_type}",
     ]
-    lines.extend(_from_to_lines(event))
+    if not (event["channel"] == "sms" and inline_has_explicit_from_to):
+        lines.extend(_from_to_lines(event))
     if duration:
         lines.append(f"Duration: {duration}")
-    inline_text = str(event.get("inline_text") or "").strip()
     if inline_text:
         lines.append(f"{_content_label(event['channel'])}:")
         lines.append(inline_text)
     else:
-        summary_text = str(event.get("summary_text") or "").strip()
+        summary_text = _clean_summary_text(event)
         action_items_text = str(event.get("action_items_text") or "").strip()
         if event.get("matching_voicemail_transcript"):
             lines.append(f"{_content_label(event['channel'])}: see matching voicemail event below")
@@ -592,7 +830,8 @@ def _event_block(index: int, event: Dict[str, Any]) -> str:
                 lines.append("Action items:")
                 lines.append(action_items_text)
         else:
-            lines.append(f"{_content_label(event['channel'])}: not available")
+            lines.append("Summary:")
+            lines.append(_event_fallback_text(event))
     return "\n".join(lines)
 
 
@@ -617,6 +856,26 @@ def _day_channel_blocks(day_events: List[Dict[str, Any]]) -> List[str]:
         if not channel_events:
             continue
         blocks.append(f"{_channel_label(channel)}")
+        if channel == "call":
+            visible_events = [event for event in channel_events if not _should_hide_call_event(event)]
+            hidden_count = len(channel_events) - len(visible_events)
+            if hidden_count:
+                blocks.append(f"Filtered {hidden_count} low-signal call record(s) from the detailed list.")
+            for index, event in enumerate(visible_events, start=1):
+                blocks.append(_event_block(index, event))
+            continue
+        if channel == "sms":
+            threads: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+            order: List[str] = []
+            for event in channel_events:
+                thread_key = _sms_thread_key(event)
+                if thread_key not in threads:
+                    order.append(thread_key)
+                threads[thread_key].append(event)
+            for index, thread_key in enumerate(order, start=1):
+                thread_events = sorted(threads[thread_key], key=lambda item: item["occurred_at"])
+                blocks.append(_sms_thread_block(index, thread_events))
+            continue
         for index, event in enumerate(channel_events, start=1):
             blocks.append(_event_block(index, event))
     return blocks

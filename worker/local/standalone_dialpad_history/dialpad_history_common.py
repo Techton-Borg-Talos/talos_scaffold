@@ -31,12 +31,12 @@ if load_dotenv is not None:
     load_dotenv(SCRIPT_DIR / ".env", override=False)
 
 ARCHIVE_ROOT = Path(
-    os.environ.get("DIALPAD_ARCHIVE_ROOT", r"Z:\Historical\Dialpad")
+    os.environ.get("DIALPAD_ARCHIVE_ROOT", r"D:\Talos_Data\Historical\Dialpad")
 ).expanduser()
 DEFAULT_CONTACTS_CSV = Path(
     os.environ.get(
         "DIALPAD_CONTACTS_CSV",
-        r"Z:\Historical\Contacts\2026_0408_master_contacts_clean.csv",
+        r"D:\Talos_Data\Historical\Contacts\2026_0408_master_contacts_clean.csv",
     )
 ).expanduser()
 DEFAULT_OFFICE_MAP = {
@@ -176,17 +176,257 @@ def _write_text(path: Path, text: str) -> int:
     return path.stat().st_size
 
 
-def _write_transcript_csv(path: Path, text: str) -> int:
+def _display_party(
+    party: Dict[str, Any],
+    *fallbacks: Optional[Any],
+    default: Optional[str] = None,
+) -> Optional[str]:
+    name = str(party.get("name") or "").strip()
+    phone = str(
+        party.get("phone")
+        or party.get("phone_number")
+        or next((fallback for fallback in fallbacks if str(fallback or "").strip()), "")
+    ).strip()
+    email = str(party.get("email") or "").strip()
+    if name and phone and name != phone:
+        return f"{name} ({phone})"
+    if name:
+        return name
+    if phone:
+        return phone
+    if email:
+        return email
+    return default
+
+
+def _contact_display(source_provenance: Dict[str, Any], default: Optional[str] = None) -> Optional[str]:
+    contact = source_provenance.get("contact") or {}
+    return _display_party(
+        contact,
+        source_provenance.get("external_number"),
+        source_provenance.get("from_number"),
+        default=default,
+    )
+
+
+def _target_display(source_provenance: Dict[str, Any], default: Optional[str] = None) -> Optional[str]:
+    target = source_provenance.get("target") or {}
+    return _display_party(
+        target,
+        source_provenance.get("internal_number"),
+        source_provenance.get("selected_caller_id"),
+        default=default,
+    )
+
+
+def _render_sms_text(payload: Dict[str, Any], sms_text: str) -> Optional[str]:
+    body = str(sms_text or "").strip()
+    if not body:
+        return None
+    if body.startswith("From: ") and "\nTo: " in body:
+        return body
+
+    source_provenance = payload.get("source_provenance") or {}
+    direction = str(source_provenance.get("direction") or payload.get("direction") or "").strip().lower()
+    contact_display = _contact_display(source_provenance, default="Unknown") or "Unknown"
+    target_display = _target_display(source_provenance, default="Unknown") or "Unknown"
+    if direction in {"outbound", "sent"}:
+        sender_display = target_display
+        recipient_display = contact_display
+    else:
+        sender_display = contact_display
+        recipient_display = target_display
+    return (
+        f"From: {sender_display}\n"
+        f"To: {recipient_display}\n"
+        f"{sender_display} -> {recipient_display}:\n\n"
+        f"{body}"
+    )
+
+
+def _normalize_speaker_label(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    digits = re.findall(r"\d+", text)
+    if digits:
+        return f"Speaker {digits[0]}"
+    lowered = text.lower()
+    if lowered == "unknown":
+        return "Unknown Speaker"
+    if lowered.startswith("speaker "):
+        return f"Speaker {text.split(' ', 1)[1].strip()}"
+    return text
+
+
+def _render_speaker_display(speaker_name: Optional[str], speaker_label: Optional[Any]) -> str:
+    name = str(speaker_name or "").strip()
+    label = _normalize_speaker_label(speaker_label)
+    if name and label:
+        if name.casefold() == label.casefold():
+            return name
+        return f"{name} ({label})"
+    if name:
+        return name
+    if label:
+        return label
+    return "Unknown Speaker"
+
+
+def _speaker_identity_from_rendered(rendered_speaker: str) -> tuple[str, str]:
+    speaker = str(rendered_speaker or "").strip()
+    if not speaker:
+        return "", ""
+    match = re.match(r"^(?P<name>.+?) \((?P<label>Speaker \d+)\)$", speaker)
+    if match:
+        return match.group("name").strip(), match.group("label").strip()
+    normalized = _normalize_speaker_label(speaker)
+    if normalized and (normalized == speaker or speaker.lower().startswith("speaker") or speaker == "Unknown Speaker"):
+        return "", normalized
+    return speaker, ""
+
+
+def _looks_like_speaker_prefix(value: str) -> bool:
+    speaker = str(value or "").strip()
+    if not speaker:
+        return False
+    lowered = speaker.lower()
+    if lowered.startswith("speaker ") or lowered == "unknown speaker":
+        return True
+    words = [word for word in re.split(r"\s+", speaker) if word]
+    if len(words) > 4:
+        return False
+    return any(ch.isalpha() for ch in speaker)
+
+
+def _is_unknown_speaker_label(value: Optional[str]) -> bool:
+    return str(value or "").strip().lower() == "unknown speaker"
+
+
+def _apply_speaker_turn_heuristic(
+    segments: List[Dict[str, str]],
+    *,
+    assume_two_party: bool,
+    fallback_speaker: Optional[str] = None,
+) -> List[Dict[str, str]]:
+    if not segments:
+        return segments
+
+    explicit_numbered_labels = [
+        segment["speaker_label"]
+        for segment in segments
+        if str(segment.get("speaker_label") or "").strip().startswith("Speaker ")
+    ]
+    has_explicit_numbered = bool(explicit_numbered_labels)
+    any_blank = any(not str(segment.get("speaker_label") or "").strip() for segment in segments)
+    any_unknown = any(_is_unknown_speaker_label(segment.get("speaker_label")) for segment in segments)
+    if not any_blank and not any_unknown:
+        return segments
+    if len(segments) < 2:
+        return segments
+    if not assume_two_party and not has_explicit_numbered:
+        return segments
+
+    next_speaker_number = 1
+    previous_speaker_number: Optional[int] = None
+    for index, segment in enumerate(segments):
+        speaker_label = str(segment.get("speaker_label") or "").strip()
+        rendered_speaker = str(segment.get("rendered_speaker") or "").strip()
+        explicit_number = None
+        if speaker_label.startswith("Speaker "):
+            digits = re.findall(r"\d+", speaker_label)
+            if digits:
+                explicit_number = int(digits[0])
+        elif _is_unknown_speaker_label(speaker_label):
+            explicit_number = next_speaker_number
+
+        if explicit_number is not None:
+            previous_speaker_number = explicit_number
+            next_speaker_number = 2 if explicit_number == 1 else 1
+            if _is_unknown_speaker_label(speaker_label) or not speaker_label:
+                segment["speaker_label"] = f"Speaker {explicit_number}"
+                segment["rendered_speaker"] = _render_speaker_display(segment.get("speaker_name"), segment["speaker_label"])
+            elif not rendered_speaker:
+                segment["rendered_speaker"] = _render_speaker_display(segment.get("speaker_name"), speaker_label)
+            continue
+
+        if previous_speaker_number is None:
+            assigned_number = 1
+        else:
+            assigned_number = 2 if previous_speaker_number == 1 else 1
+        segment["speaker_label"] = f"Speaker {assigned_number}"
+        if assigned_number == 1 and fallback_speaker and not str(segment.get("speaker_name") or "").strip():
+            segment["speaker_name"] = fallback_speaker
+        segment["rendered_speaker"] = _render_speaker_display(segment.get("speaker_name"), segment["speaker_label"])
+        previous_speaker_number = assigned_number
+        next_speaker_number = 2 if assigned_number == 1 else 1
+
+    return segments
+
+
+def _render_transcript_segments(segments: List[Dict[str, str]]) -> str:
+    rendered: List[str] = []
+    for segment in segments:
+        content = str(segment.get("text") or "").strip()
+        if not content:
+            continue
+        rendered_speaker = str(segment.get("rendered_speaker") or "").strip()
+        rendered.append(f"{rendered_speaker}: {content}" if rendered_speaker else content)
+    return "\n".join(rendered).strip()
+
+
+def _transcript_segments_from_text(text: str) -> List[Dict[str, str]]:
     normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
     rows = [row.strip() for row in normalized.split("\n") if row.strip()]
+    segments: List[Dict[str, str]] = []
+    if rows:
+        for index, row in enumerate(rows, start=1):
+            rendered_speaker = ""
+            content = row
+            match = re.match(r"^(?P<speaker>[^:\n]{1,200}):\s*(?P<content>.+)$", row)
+            if match and _looks_like_speaker_prefix(match.group("speaker")):
+                rendered_speaker = match.group("speaker").strip()
+                content = match.group("content").strip()
+            speaker_name, speaker_label = _speaker_identity_from_rendered(rendered_speaker)
+            segments.append(
+                {
+                    "line_number": str(index),
+                    "speaker_label": speaker_label,
+                    "speaker_name": speaker_name,
+                    "rendered_speaker": rendered_speaker,
+                    "text": content,
+                }
+            )
+        return _apply_speaker_turn_heuristic(segments, assume_two_party=True)
+    if normalized:
+        speaker_name, speaker_label = _speaker_identity_from_rendered("")
+        return [
+            {
+                "line_number": "1",
+                "speaker_label": speaker_label,
+                "speaker_name": speaker_name,
+                "rendered_speaker": "",
+                "text": normalized,
+            }
+        ]
+    return []
+
+
+def _write_transcript_csv(path: Path, text: str) -> int:
+    segments = _transcript_segments_from_text(text)
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["line_number", "text"])
-        if rows:
-            for index, row in enumerate(rows, start=1):
-                writer.writerow([index, row])
-        else:
-            writer.writerow([1, normalized])
+        writer.writerow(["line_number", "speaker_label", "speaker_name", "rendered_speaker", "text"])
+        for segment in segments:
+            writer.writerow(
+                [
+                    segment["line_number"],
+                    segment["speaker_label"],
+                    segment["speaker_name"],
+                    segment["rendered_speaker"],
+                    segment["text"],
+                ]
+            )
     return path.stat().st_size
 
 
@@ -194,6 +434,40 @@ def _write_json(path: Path, payload: Dict[str, Any]) -> int:
     rendered = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
     path.write_text(rendered, encoding="utf-8")
     return path.stat().st_size
+
+
+def _normalized_lookup_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def _iter_named_values(obj: Any, target_keys: List[str] | tuple[str, ...]) -> List[Any]:
+    normalized_targets = {_normalized_lookup_key(key) for key in target_keys}
+    results: List[Any] = []
+
+    def _walk(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if _normalized_lookup_key(key) in normalized_targets:
+                    results.append(child)
+                _walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                _walk(child)
+
+    _walk(obj)
+    return results
+
+
+def _clean_text_candidate(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    text = value.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return None
+    lowered = text.lower()
+    if lowered.startswith("http://") or lowered.startswith("https://"):
+        return None
+    return text
 
 
 def _write_bytes(path: Path, content: bytes) -> int:
@@ -626,6 +900,70 @@ def _call_id_for_payload(payload: Dict[str, Any]) -> str:
         or payload.get("external_id")
         or ""
     ).strip()
+
+
+def _inferred_transcript_speaker(payload: Dict[str, Any]) -> Optional[str]:
+    source_provenance = payload.get("source_provenance") or {}
+    channel = _archive_channel(payload)
+    direction = str(source_provenance.get("direction") or payload.get("direction") or "").strip().lower()
+    if channel == "voicemail":
+        if direction in {"outbound", "sent", "internal"}:
+            return _target_display(source_provenance)
+        return _contact_display(source_provenance)
+    return None
+
+
+def _structured_transcript_lines(candidate: Any) -> List[Dict[str, Any]]:
+    if isinstance(candidate, dict):
+        direct_lines = candidate.get("lines")
+        if isinstance(direct_lines, list):
+            return [line for line in direct_lines if isinstance(line, dict)]
+        for value in _iter_named_values(candidate, ("lines", "transcript_lines", "segments")):
+            if isinstance(value, list):
+                return [line for line in value if isinstance(line, dict)]
+    return []
+
+
+def _render_structured_transcript(candidate: Any, fallback_speaker: Optional[str]) -> Optional[str]:
+    lines = _structured_transcript_lines(candidate)
+    if not lines:
+        return None
+    segments: List[Dict[str, str]] = []
+    for index, line in enumerate(lines, start=1):
+        line_type = str(line.get("type") or "").strip().lower()
+        if line_type and line_type not in {"transcript", "utterance", "segment"}:
+            continue
+        content = _clean_text_candidate(
+            line.get("content") or line.get("text") or line.get("transcript") or line.get("body")
+        )
+        if not content:
+            continue
+        speaker_name = _clean_text_candidate(line.get("speaker_name") or line.get("name")) or fallback_speaker
+        speaker_label = line.get("speaker_label") or line.get("speaker") or line.get("speaker_id")
+        if not speaker_label and fallback_speaker:
+            speaker_label = "Speaker 1"
+        rendered_speaker = _render_speaker_display(speaker_name, speaker_label)
+        segments.append(
+            {
+                "line_number": str(index),
+                "speaker_label": str(_normalize_speaker_label(speaker_label) or ""),
+                "speaker_name": str(speaker_name or ""),
+                "rendered_speaker": rendered_speaker,
+                "text": content,
+            }
+        )
+    segments = _apply_speaker_turn_heuristic(
+        segments,
+        assume_two_party=True,
+        fallback_speaker=fallback_speaker,
+    )
+    rendered = _render_transcript_segments(segments)
+    return rendered or None
+
+
+def _looks_like_labeled_transcript(text: str) -> bool:
+    first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    return bool(re.match(r"^[^:\n]{1,200}:\s+\S", first_line))
 
 
 def _archive_lock_key(payload: Dict[str, Any]) -> str:
@@ -1345,9 +1683,39 @@ async def handle_archive_export(job: Dict[str, Any]) -> Dict[str, Any]:
             )
 
         provider_transcript_text = payload.get("provider_transcript_text")
-        if isinstance(provider_transcript_text, str) and provider_transcript_text.strip():
+        fallback_speaker = _inferred_transcript_speaker(payload)
+        rendered_provider_transcript = None
+        for candidate in (
+            payload.get("provider_transcript_payload"),
+            payload.get("source_metadata") or {},
+            provider_transcript_text if isinstance(provider_transcript_text, dict) else None,
+        ):
+            rendered_provider_transcript = _render_structured_transcript(candidate, fallback_speaker)
+            if rendered_provider_transcript:
+                break
+        if not rendered_provider_transcript and isinstance(provider_transcript_text, str) and provider_transcript_text.strip():
+            if _looks_like_labeled_transcript(provider_transcript_text):
+                rendered_provider_transcript = provider_transcript_text
+            else:
+                transcript_segments = _transcript_segments_from_text(provider_transcript_text)
+                transcript_segments = _apply_speaker_turn_heuristic(
+                    transcript_segments,
+                    assume_two_party=_archive_channel(payload) == "call",
+                    fallback_speaker=fallback_speaker,
+                )
+                if len(transcript_segments) == 1:
+                    transcript_segments[0]["speaker_name"] = transcript_segments[0].get("speaker_name") or str(fallback_speaker or "")
+                    transcript_segments[0]["speaker_label"] = transcript_segments[0].get("speaker_label") or (
+                        "Speaker 1" if fallback_speaker else "Unknown Speaker"
+                    )
+                    transcript_segments[0]["rendered_speaker"] = _render_speaker_display(
+                        transcript_segments[0]["speaker_name"],
+                        transcript_segments[0]["speaker_label"],
+                    )
+                rendered_provider_transcript = _render_transcript_segments(transcript_segments)
+        if rendered_provider_transcript:
             transcript_path = archive_dir / f"{event_stem}_provider_transcript.txt"
-            transcript_size = _write_text(transcript_path, provider_transcript_text)
+            transcript_size = _write_text(transcript_path, rendered_provider_transcript)
             manifest.append(
                 _manifest_entry(
                     transcript_path,
@@ -1361,7 +1729,7 @@ async def handle_archive_export(job: Dict[str, Any]) -> Dict[str, Any]:
                 )
             )
             transcript_csv_path = archive_dir / f"{event_stem}_provider_transcript.csv"
-            transcript_csv_size = _write_transcript_csv(transcript_csv_path, provider_transcript_text)
+            transcript_csv_size = _write_transcript_csv(transcript_csv_path, rendered_provider_transcript)
             manifest.append(
                 _manifest_entry(
                     transcript_csv_path,
@@ -1376,9 +1744,10 @@ async def handle_archive_export(job: Dict[str, Any]) -> Dict[str, Any]:
             )
 
         sms_text = payload.get("sms_text")
-        if isinstance(sms_text, str) and sms_text.strip():
+        rendered_sms_text = _render_sms_text(payload, sms_text) if isinstance(sms_text, str) else None
+        if rendered_sms_text:
             sms_path = archive_dir / f"{event_stem}_text.txt"
-            sms_size = _write_text(sms_path, sms_text)
+            sms_size = _write_text(sms_path, rendered_sms_text)
             manifest.append(
                 _manifest_entry(
                     sms_path,
@@ -1440,8 +1809,8 @@ async def handle_archive_export(job: Dict[str, Any]) -> Dict[str, Any]:
             "event_uuid": event_uuid,
             "archive_dir": str(archive_dir),
             "archive_files": final_manifest,
-            "provider_transcript_preserved": bool(provider_transcript_text),
-            "sms_text_preserved": bool(sms_text),
+            "provider_transcript_preserved": bool(rendered_provider_transcript),
+            "sms_text_preserved": bool(rendered_sms_text),
             "recording_reference_count": len(recording_references or []),
             "audio_downloads": audio_results,
         }

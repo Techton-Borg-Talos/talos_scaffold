@@ -12,9 +12,11 @@ import csv
 import io
 import json
 import os
+import sys
 import textwrap
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
+from time import monotonic
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import urlparse
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -29,6 +31,93 @@ DEFAULT_OFFICE_ID = "4943523498434560"
 DEFAULT_CHUNK_DAYS = 7
 DEFAULT_PROGRESS_EVERY = 10
 DEFAULT_TYPES = ("calls", "texts", "voicemails")
+PROGRESS_BAR_WIDTH = 24
+
+
+def _format_elapsed(seconds: float) -> str:
+    total_seconds = max(0, int(seconds))
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    secs = total_seconds % 60
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+class _RunProgress:
+    def __init__(self, total_chunks: int) -> None:
+        self.total_chunks = max(1, total_chunks)
+        self.start_monotonic = monotonic()
+        self.chunk_start_monotonic = self.start_monotonic
+        self.current_chunk = 0
+        self.current_chunk_label = ""
+        self.current_phase = "starting"
+        self.last_render = ""
+        self.is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+
+    def start_chunk(self, chunk_index: int, chunk_start: date, chunk_end: date) -> None:
+        self.current_chunk = chunk_index
+        self.chunk_start_monotonic = monotonic()
+        self.current_chunk_label = f"{chunk_start.isoformat()} -> {chunk_end.isoformat()}"
+        self.current_phase = "chunk starting"
+        self._render(self._chunk_base_fraction())
+
+    def set_phase(self, phase: str, detail: str = "") -> None:
+        self.current_phase = f"{phase}: {detail}" if detail else phase
+        self._render(self._chunk_base_fraction())
+
+    def set_item_progress(self, phase: str, current: int, total: int, detail: str = "") -> None:
+        total = max(1, total)
+        fraction = self._chunk_base_fraction() + ((current / total) / self.total_chunks)
+        self.current_phase = f"{phase}: {detail}" if detail else f"{phase} {current}/{total}"
+        self._render(min(1.0, fraction))
+
+    def finish_chunk(self) -> None:
+        chunk_elapsed = monotonic() - self.chunk_start_monotonic
+        self.current_phase = f"chunk complete in {_format_elapsed(chunk_elapsed)}"
+        self._render(self.current_chunk / self.total_chunks)
+
+    def log(self, message: str) -> None:
+        if self.is_tty and self.last_render:
+            print("", flush=True)
+        print(message, flush=True)
+        if self.is_tty and self.last_render:
+            self._render(self._current_fraction())
+
+    def close(self) -> None:
+        if self.is_tty and self.last_render:
+            print("", flush=True)
+
+    def _chunk_base_fraction(self) -> float:
+        return max(0.0, (self.current_chunk - 1) / self.total_chunks)
+
+    def _current_fraction(self) -> float:
+        if self.current_chunk <= 0:
+            return 0.0
+        if self.current_chunk >= self.total_chunks and "chunk complete" in self.current_phase:
+            return 1.0
+        return self._chunk_base_fraction()
+
+    def _render(self, fraction: float) -> None:
+        if not self.is_tty:
+            return
+        bounded_fraction = max(0.0, min(1.0, fraction))
+        filled = int(round(PROGRESS_BAR_WIDTH * bounded_fraction))
+        bar = "#" * filled + "-" * (PROGRESS_BAR_WIDTH - filled)
+        elapsed = monotonic() - self.start_monotonic
+        eta = "--:--"
+        if bounded_fraction > 0:
+            remaining = max(0.0, elapsed * ((1.0 - bounded_fraction) / bounded_fraction))
+            eta = _format_elapsed(remaining)
+        line = (
+            f"[DIALPAD_BACKFILL] [{bar}] "
+            f"chunk {max(self.current_chunk, 0)}/{self.total_chunks} "
+            f"| {self.current_phase} "
+            f"| elapsed { _format_elapsed(elapsed) } "
+            f"| eta {eta}"
+        )
+        print("\r" + line.ljust(max(len(self.last_render), len(line))), end="", flush=True)
+        self.last_render = line
 
 
 def _normalize_phone(value: Any) -> Optional[str]:
@@ -174,6 +263,19 @@ def _row_local_day(stat_type: str, row: Dict[str, Any]) -> Optional[date]:
         if parsed is not None:
             return parsed.astimezone(archive_tz).date()
     return None
+
+
+def _rows_local_day_range(stat_type: str, rows: List[Dict[str, str]]) -> tuple[Optional[date], Optional[date]]:
+    days = sorted(
+        {
+            local_day
+            for row in rows
+            if (local_day := _row_local_day(stat_type, row)) is not None
+        }
+    )
+    if not days:
+        return None, None
+    return days[0], days[-1]
 
 
 def _sort_rows_for_archive(stat_type: str, rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
@@ -351,9 +453,18 @@ def _flatten_transcript_payload(payload: Dict[str, Any]) -> Optional[str]:
         content = str(line.get("content") or line.get("text") or "").strip()
         if not content:
             continue
-        speaker = (
-            str(line.get("speaker_name") or line.get("speaker_label") or line.get("speaker") or "").strip()
-        )
+        speaker_name = str(line.get("speaker_name") or "").strip()
+        raw_speaker_label = str(line.get("speaker_label") or line.get("speaker") or "").strip()
+        speaker_label = raw_speaker_label
+        digits = "".join(ch for ch in raw_speaker_label if ch.isdigit())
+        if digits:
+            speaker_label = f"Speaker {digits}"
+        elif raw_speaker_label.lower() == "unknown":
+            speaker_label = "Unknown Speaker"
+        if speaker_name and speaker_label:
+            speaker = f"{speaker_name} ({speaker_label})"
+        else:
+            speaker = speaker_name or speaker_label
         rendered.append(f"{speaker}: {content}" if speaker else content)
     joined = "\n".join(rendered).strip()
     return joined or None
@@ -366,10 +477,16 @@ async def _fetch_csv_rows(
     target_id: str,
     date_start: str,
     date_end: str,
+    progress: Optional[_RunProgress] = None,
 ) -> List[Dict[str, str]]:
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
         last_error: Optional[httpx.HTTPStatusError] = None
         for stats_timezone in ae._dialpad_stats_timezones():
+            if progress is not None:
+                progress.set_phase(
+                    f"requesting {stat_type} export",
+                    f"{target_type}:{target_id} {date_start}->{date_end} tz={stats_timezone}",
+                )
             response = await ae._dialpad_request(
                 "POST",
                 f"{ae.DIALPAD_API_BASE}/stats",
@@ -410,9 +527,19 @@ async def _fetch_csv_rows(
                 return []
 
             if ae.DIALPAD_STATS_POLL_WAIT:
+                if progress is not None:
+                    progress.set_phase(
+                        f"waiting for {stat_type} export readiness",
+                        f"request_id={request_id} sleep={ae.DIALPAD_STATS_POLL_WAIT}s",
+                    )
                 await asyncio.sleep(ae.DIALPAD_STATS_POLL_WAIT)
 
-            for _ in range(ae.DIALPAD_STATS_POLL_MAX):
+            for poll_attempt in range(1, ae.DIALPAD_STATS_POLL_MAX + 1):
+                if progress is not None:
+                    progress.set_phase(
+                        f"polling {stat_type} export",
+                        f"request_id={request_id} attempt {poll_attempt}/{ae.DIALPAD_STATS_POLL_MAX}",
+                    )
                 poll = await ae._dialpad_request(
                     "GET",
                     f"{ae.DIALPAD_API_BASE}/stats/{request_id}",
@@ -422,6 +549,11 @@ async def _fetch_csv_rows(
                 poll_body = poll.json()
                 download_url = poll_body.get("download_url") or poll_body.get("url") or poll_body.get("file_url")
                 if download_url:
+                    if progress is not None:
+                        progress.set_phase(
+                            f"downloading {stat_type} export",
+                            f"request_id={request_id}",
+                        )
                     download = await ae._dialpad_request("GET", download_url, client=client)
                     download.raise_for_status()
                     reader = csv.DictReader(io.StringIO(download.text.lstrip("\ufeff")))
@@ -434,7 +566,16 @@ async def _fetch_csv_rows(
                     ]
                 state = str(poll_body.get("state") or poll_body.get("status") or "").lower()
                 if state in {"failed", "error"}:
+                    if progress is not None:
+                        progress.log(
+                            f"[DIALPAD_BACKFILL] {stat_type} export request {request_id} failed in Dialpad poll state '{state}'"
+                        )
                     return []
+                if progress is not None:
+                    progress.set_phase(
+                        f"waiting for {stat_type} export",
+                        f"request_id={request_id} retry in {ae.DIALPAD_STATS_POLL_RETRY}s",
+                    )
                 await asyncio.sleep(ae.DIALPAD_STATS_POLL_RETRY)
             return []
         if last_error is not None:
@@ -562,7 +703,12 @@ async def _archive_sms_row(row: Dict[str, Any], fallback_day: date, office_id: s
     return await ae.handle_archive_export(job)
 
 
-async def _archive_voicemail_row(row: Dict[str, Any], fallback_day: date, office_id: str) -> Dict[str, Any]:
+async def _archive_voicemail_row(
+    row: Dict[str, Any],
+    fallback_day: date,
+    office_id: str,
+    progress: Optional[_RunProgress] = None,
+) -> Dict[str, Any]:
     external_id = _row_external_id("voicemail", row)
     event_uuid = _deterministic_event_uuid("voicemail", external_id)
     occurred_at = _occurred_at_for_row("voicemail", row, fallback_day)
@@ -594,6 +740,16 @@ async def _archive_voicemail_row(row: Dict[str, Any], fallback_day: date, office
             )
         )
     provider_transcript_text = str(row.get("transcription_text") or "").strip() or None
+    if not provider_transcript_text and external_id:
+        try:
+            if progress is not None:
+                progress.set_phase(
+                    "fetching voicemail transcript",
+                    str(row.get("name") or row.get("external_number") or external_id),
+                )
+            provider_transcript_text = await _fetch_call_transcript(external_id)
+        except Exception:
+            provider_transcript_text = None
     payload = {
         "event_uuid": event_uuid,
         "channel": "voicemail",
@@ -622,6 +778,11 @@ async def _archive_voicemail_row(row: Dict[str, Any], fallback_day: date, office
         "event_uuid": event_uuid,
         "payload": payload,
     }
+    if progress is not None:
+        progress.set_phase(
+            "writing voicemail archive files",
+            f"{source_provenance.get('contact', {}).get('name') or source_provenance.get('external_number') or external_id}",
+        )
     return await ae.handle_archive_export(job)
 
 
@@ -631,6 +792,7 @@ async def _archive_call_row(
     office_id: str,
     recording_rows: List[Dict[str, Any]],
     include_call_transcripts: bool,
+    progress: Optional[_RunProgress] = None,
 ) -> Dict[str, Any]:
     external_id = _row_external_id("call", row)
     event_uuid = _deterministic_event_uuid("call", external_id)
@@ -658,6 +820,11 @@ async def _archive_call_row(
     provider_transcript_text = None
     if include_call_transcripts and not str(row.get("category") or "").strip().lower().startswith("missed"):
         try:
+            if progress is not None:
+                progress.set_phase(
+                    "fetching call transcript",
+                    str(row.get("contact_name") or row.get("name") or row.get("external_number") or external_id),
+                )
             provider_transcript_text = await _fetch_call_transcript(external_id)
         except Exception:
             provider_transcript_text = None
@@ -688,6 +855,11 @@ async def _archive_call_row(
         "event_uuid": event_uuid,
         "payload": payload,
     }
+    if progress is not None:
+        progress.set_phase(
+            "writing call archive files",
+            str(row.get("contact_name") or row.get("name") or row.get("external_number") or external_id),
+        )
     return await ae.handle_archive_export(job)
 
 
@@ -697,6 +869,7 @@ async def _fetch_rows_for_chunk(
     chunk_start: date,
     chunk_end: date,
     target_candidates: List[tuple[str, str]],
+    progress: Optional[_RunProgress] = None,
 ) -> List[Dict[str, str]]:
     chunk_rows: List[Dict[str, str]] = []
     last_error: Optional[Exception] = None
@@ -708,28 +881,76 @@ async def _fetch_rows_for_chunk(
                 target_id=candidate_id,
                 date_start=chunk_start.isoformat(),
                 date_end=chunk_end.isoformat(),
+                progress=progress,
             )
-            print(
+            message = (
                 f"[DIALPAD_BACKFILL] {stat_type} chunk {chunk_start.isoformat()} -> {chunk_end.isoformat()} "
                 f"used target {candidate_type}:{candidate_id}"
             )
+            if progress is not None:
+                progress.log(message)
+            else:
+                print(message)
             break
         except httpx.HTTPStatusError as exc:
             last_error = exc
             status = exc.response.status_code if exc.response is not None else "unknown"
-            print(
+            message = (
                 f"[DIALPAD_BACKFILL] {stat_type} target {candidate_type}:{candidate_id} failed "
                 f"with HTTP {status}; trying next target"
             )
+            if progress is not None:
+                progress.log(message)
+            else:
+                print(message)
             continue
     if not chunk_rows and last_error is not None:
         raise last_error
 
     filtered_rows, dropped_rows = _filter_rows_to_chunk(stat_type, chunk_rows, chunk_start, chunk_end)
-    print(
+    raw_min_day, raw_max_day = _rows_local_day_range(stat_type, chunk_rows)
+    if progress is not None:
+        progress.set_phase(
+            f"filtering {stat_type} rows",
+            f"{len(chunk_rows)} raw rows for {chunk_start.isoformat()} -> {chunk_end.isoformat()}",
+        )
+    message = (
         f"[DIALPAD_BACKFILL] {stat_type} {chunk_start.isoformat()} -> {chunk_end.isoformat()} : "
         f"{len(chunk_rows)} raw rows, {len(filtered_rows)} in-window, {dropped_rows} out-of-window"
     )
+    if progress is not None:
+        progress.log(message)
+    else:
+        print(message)
+    if raw_min_day is not None and raw_max_day is not None:
+        message = (
+            f"[DIALPAD_BACKFILL] {stat_type} raw date coverage: "
+            f"{raw_min_day.isoformat()} -> {raw_max_day.isoformat()}"
+        )
+        if progress is not None:
+            progress.log(message)
+        else:
+            print(message)
+    if chunk_rows and not filtered_rows and raw_max_day is not None and raw_max_day < chunk_start:
+        today_local = datetime.now(ae._archive_timezone()).date()
+        if chunk_end >= today_local:
+            warning = (
+                f"[DIALPAD_BACKFILL] WARNING {stat_type}: Dialpad stats export currently only returned "
+                f"rows through {raw_max_day.isoformat()} while you requested "
+                f"{chunk_start.isoformat()} -> {chunk_end.isoformat()}. "
+                "Same-day history may not be available yet from the stats export; the live webhook archive "
+                "is the source of truth for today."
+            )
+        else:
+            warning = (
+                f"[DIALPAD_BACKFILL] WARNING {stat_type}: Dialpad stats export returned rows only through "
+                f"{raw_max_day.isoformat()} for requested window {chunk_start.isoformat()} -> "
+                f"{chunk_end.isoformat()}. The provider export appears to be ignoring or lagging the requested dates."
+            )
+        if progress is not None:
+            progress.log(warning)
+        else:
+            print(warning)
     return _sort_rows_for_archive(stat_type, filtered_rows)
 
 
@@ -776,149 +997,183 @@ async def run_backfill(args: argparse.Namespace) -> Dict[str, Any]:
         "texts_archived": 0,
         "voicemails_archived": 0,
     }
+    progress = _RunProgress(len(chunks))
 
-    for chunk_index, (chunk_start, chunk_end) in enumerate(chunks, start=1):
-        print(
-            f"[DIALPAD_BACKFILL] chunk {chunk_index}/{len(chunks)} "
-            f"{chunk_start.isoformat()} -> {chunk_end.isoformat()} starting"
-        )
-
-        if "texts" in requested_types:
-            text_rows = await _fetch_rows_for_chunk(
-                stat_type="texts",
-                chunk_start=chunk_start,
-                chunk_end=chunk_end,
-                target_candidates=target_candidates,
-            )
-            new_text_rows: List[Dict[str, str]] = []
-            duplicate_texts = 0
-            for row in text_rows:
-                key = _row_unique_key("texts", row)
-                if key in seen_keys["texts"]:
-                    duplicate_texts += 1
-                    continue
-                seen_keys["texts"].add(key)
-                new_text_rows.append(row)
-            counts["texts_rows"] += len(new_text_rows)
-            print(
-                f"[DIALPAD_BACKFILL] texts chunk {chunk_index}/{len(chunks)} retained "
-                f"{len(new_text_rows)} new rows, skipped {duplicate_texts} duplicates "
-                f"({counts['texts_rows']} unique cumulative)"
-            )
-            for row_index, row in enumerate(new_text_rows, start=1):
-                await _archive_sms_row(row, chunk_start, office_id)
-                counts["texts_archived"] += 1
-                if _should_log_archive_progress(row_index, len(new_text_rows), progress_every):
-                    print(
-                        f"[DIALPAD_BACKFILL] archive texts chunk {chunk_index}/{len(chunks)} "
-                        f"{row_index}/{len(new_text_rows)} complete "
-                        f"({counts['texts_archived']} cumulative archived)"
-                    )
-
-        if "voicemails" in requested_types:
-            voicemail_rows = await _fetch_rows_for_chunk(
-                stat_type="voicemails",
-                chunk_start=chunk_start,
-                chunk_end=chunk_end,
-                target_candidates=target_candidates,
-            )
-            new_voicemail_rows: List[Dict[str, str]] = []
-            duplicate_voicemails = 0
-            for row in voicemail_rows:
-                key = _row_unique_key("voicemails", row)
-                if key in seen_keys["voicemails"]:
-                    duplicate_voicemails += 1
-                    continue
-                seen_keys["voicemails"].add(key)
-                new_voicemail_rows.append(row)
-            counts["voicemails_rows"] += len(new_voicemail_rows)
-            print(
-                f"[DIALPAD_BACKFILL] voicemails chunk {chunk_index}/{len(chunks)} retained "
-                f"{len(new_voicemail_rows)} new rows, skipped {duplicate_voicemails} duplicates "
-                f"({counts['voicemails_rows']} unique cumulative)"
-            )
-            for row_index, row in enumerate(new_voicemail_rows, start=1):
-                await _archive_voicemail_row(row, chunk_start, office_id)
-                counts["voicemails_archived"] += 1
-                if _should_log_archive_progress(row_index, len(new_voicemail_rows), progress_every):
-                    print(
-                        f"[DIALPAD_BACKFILL] archive voicemails chunk {chunk_index}/{len(chunks)} "
-                        f"{row_index}/{len(new_voicemail_rows)} complete "
-                        f"({counts['voicemails_archived']} cumulative archived)"
-                    )
-
-        if "calls" in requested_types:
-            recording_rows = await _fetch_rows_for_chunk(
-                stat_type="recordings",
-                chunk_start=chunk_start,
-                chunk_end=chunk_end,
-                target_candidates=target_candidates,
-            )
-            new_recording_rows: List[Dict[str, str]] = []
-            duplicate_recordings = 0
-            for row in recording_rows:
-                key = _row_unique_key("recordings", row)
-                if key in seen_keys["recordings"]:
-                    duplicate_recordings += 1
-                    continue
-                seen_keys["recordings"].add(key)
-                new_recording_rows.append(row)
-            counts["recordings_rows"] += len(new_recording_rows)
-            for row in new_recording_rows:
-                call_id = str(row.get("call_id") or row.get("id") or "").strip()
-                if call_id:
-                    recordings_by_call_id[call_id].append(row)
-            print(
-                f"[DIALPAD_BACKFILL] recordings chunk {chunk_index}/{len(chunks)} retained "
-                f"{len(new_recording_rows)} new rows, skipped {duplicate_recordings} duplicates "
-                f"({counts['recordings_rows']} unique cumulative)"
+    try:
+        for chunk_index, (chunk_start, chunk_end) in enumerate(chunks, start=1):
+            progress.start_chunk(chunk_index, chunk_start, chunk_end)
+            progress.log(
+                f"[DIALPAD_BACKFILL] chunk {chunk_index}/{len(chunks)} "
+                f"{chunk_start.isoformat()} -> {chunk_end.isoformat()} starting"
             )
 
-            call_rows = await _fetch_rows_for_chunk(
-                stat_type="calls",
-                chunk_start=chunk_start,
-                chunk_end=chunk_end,
-                target_candidates=target_candidates,
-            )
-            new_call_rows: List[Dict[str, str]] = []
-            duplicate_calls = 0
-            for row in call_rows:
-                key = _row_unique_key("calls", row)
-                if key in seen_keys["calls"]:
-                    duplicate_calls += 1
-                    continue
-                seen_keys["calls"].add(key)
-                new_call_rows.append(row)
-            counts["calls_rows"] += len(new_call_rows)
-            print(
-                f"[DIALPAD_BACKFILL] calls chunk {chunk_index}/{len(chunks)} retained "
-                f"{len(new_call_rows)} new rows, skipped {duplicate_calls} duplicates "
-                f"({counts['calls_rows']} unique cumulative)"
-            )
-            for row_index, row in enumerate(new_call_rows, start=1):
-                call_id = str(row.get("call_id") or row.get("id") or "").strip()
-                await _archive_call_row(
-                    row,
-                    chunk_start,
-                    office_id,
-                    recordings_by_call_id.get(call_id, []),
-                    include_call_transcripts=not args.skip_call_transcripts,
+            if "texts" in requested_types:
+                progress.set_phase("fetching texts export", f"chunk {chunk_index}/{len(chunks)}")
+                text_rows = await _fetch_rows_for_chunk(
+                    stat_type="texts",
+                    chunk_start=chunk_start,
+                    chunk_end=chunk_end,
+                    target_candidates=target_candidates,
+                    progress=progress,
                 )
-                counts["calls_archived"] += 1
-                if _should_log_archive_progress(row_index, len(new_call_rows), progress_every):
-                    print(
-                        f"[DIALPAD_BACKFILL] archive calls chunk {chunk_index}/{len(chunks)} "
-                        f"{row_index}/{len(new_call_rows)} complete "
-                        f"({counts['calls_archived']} cumulative archived)"
+                new_text_rows: List[Dict[str, str]] = []
+                duplicate_texts = 0
+                for row in text_rows:
+                    key = _row_unique_key("texts", row)
+                    if key in seen_keys["texts"]:
+                        duplicate_texts += 1
+                        continue
+                    seen_keys["texts"].add(key)
+                    new_text_rows.append(row)
+                counts["texts_rows"] += len(new_text_rows)
+                progress.log(
+                    f"[DIALPAD_BACKFILL] texts chunk {chunk_index}/{len(chunks)} retained "
+                    f"{len(new_text_rows)} new rows, skipped {duplicate_texts} duplicates "
+                    f"({counts['texts_rows']} unique cumulative)"
+                )
+                for row_index, row in enumerate(new_text_rows, start=1):
+                    progress.set_item_progress(
+                        "archiving texts",
+                        row_index,
+                        len(new_text_rows),
+                        f"{row_index}/{len(new_text_rows)}",
                     )
+                    await _archive_sms_row(row, chunk_start, office_id)
+                    counts["texts_archived"] += 1
+                    if _should_log_archive_progress(row_index, len(new_text_rows), progress_every):
+                        progress.log(
+                            f"[DIALPAD_BACKFILL] archive texts chunk {chunk_index}/{len(chunks)} "
+                            f"{row_index}/{len(new_text_rows)} complete "
+                            f"({counts['texts_archived']} cumulative archived)"
+                        )
 
-        print(
-            f"[DIALPAD_BACKFILL] chunk {chunk_index}/{len(chunks)} complete: "
-            f"calls={counts['calls_archived']} texts={counts['texts_archived']} "
-            f"voicemails={counts['voicemails_archived']} recordings={counts['recordings_rows']}"
-        )
+            if "voicemails" in requested_types:
+                progress.set_phase("fetching voicemails export", f"chunk {chunk_index}/{len(chunks)}")
+                voicemail_rows = await _fetch_rows_for_chunk(
+                    stat_type="voicemails",
+                    chunk_start=chunk_start,
+                    chunk_end=chunk_end,
+                    target_candidates=target_candidates,
+                    progress=progress,
+                )
+                new_voicemail_rows: List[Dict[str, str]] = []
+                duplicate_voicemails = 0
+                for row in voicemail_rows:
+                    key = _row_unique_key("voicemails", row)
+                    if key in seen_keys["voicemails"]:
+                        duplicate_voicemails += 1
+                        continue
+                    seen_keys["voicemails"].add(key)
+                    new_voicemail_rows.append(row)
+                counts["voicemails_rows"] += len(new_voicemail_rows)
+                progress.log(
+                    f"[DIALPAD_BACKFILL] voicemails chunk {chunk_index}/{len(chunks)} retained "
+                    f"{len(new_voicemail_rows)} new rows, skipped {duplicate_voicemails} duplicates "
+                    f"({counts['voicemails_rows']} unique cumulative)"
+                )
+                for row_index, row in enumerate(new_voicemail_rows, start=1):
+                    progress.set_item_progress(
+                        "archiving voicemails",
+                        row_index,
+                        len(new_voicemail_rows),
+                        f"{row_index}/{len(new_voicemail_rows)}",
+                    )
+                    await _archive_voicemail_row(row, chunk_start, office_id, progress=progress)
+                    counts["voicemails_archived"] += 1
+                    if _should_log_archive_progress(row_index, len(new_voicemail_rows), progress_every):
+                        progress.log(
+                            f"[DIALPAD_BACKFILL] archive voicemails chunk {chunk_index}/{len(chunks)} "
+                            f"{row_index}/{len(new_voicemail_rows)} complete "
+                            f"({counts['voicemails_archived']} cumulative archived)"
+                        )
+
+            if "calls" in requested_types:
+                progress.set_phase("fetching recordings export", f"chunk {chunk_index}/{len(chunks)}")
+                recording_rows = await _fetch_rows_for_chunk(
+                    stat_type="recordings",
+                    chunk_start=chunk_start,
+                    chunk_end=chunk_end,
+                    target_candidates=target_candidates,
+                    progress=progress,
+                )
+                new_recording_rows: List[Dict[str, str]] = []
+                duplicate_recordings = 0
+                for row in recording_rows:
+                    key = _row_unique_key("recordings", row)
+                    if key in seen_keys["recordings"]:
+                        duplicate_recordings += 1
+                        continue
+                    seen_keys["recordings"].add(key)
+                    new_recording_rows.append(row)
+                counts["recordings_rows"] += len(new_recording_rows)
+                for row in new_recording_rows:
+                    call_id = str(row.get("call_id") or row.get("id") or "").strip()
+                    if call_id:
+                        recordings_by_call_id[call_id].append(row)
+                progress.log(
+                    f"[DIALPAD_BACKFILL] recordings chunk {chunk_index}/{len(chunks)} retained "
+                    f"{len(new_recording_rows)} new rows, skipped {duplicate_recordings} duplicates "
+                    f"({counts['recordings_rows']} unique cumulative)"
+                )
+
+                progress.set_phase("fetching calls export", f"chunk {chunk_index}/{len(chunks)}")
+                call_rows = await _fetch_rows_for_chunk(
+                    stat_type="calls",
+                    chunk_start=chunk_start,
+                    chunk_end=chunk_end,
+                    target_candidates=target_candidates,
+                    progress=progress,
+                )
+                new_call_rows: List[Dict[str, str]] = []
+                duplicate_calls = 0
+                for row in call_rows:
+                    key = _row_unique_key("calls", row)
+                    if key in seen_keys["calls"]:
+                        duplicate_calls += 1
+                        continue
+                    seen_keys["calls"].add(key)
+                    new_call_rows.append(row)
+                counts["calls_rows"] += len(new_call_rows)
+                progress.log(
+                    f"[DIALPAD_BACKFILL] calls chunk {chunk_index}/{len(chunks)} retained "
+                    f"{len(new_call_rows)} new rows, skipped {duplicate_calls} duplicates "
+                    f"({counts['calls_rows']} unique cumulative)"
+                )
+                for row_index, row in enumerate(new_call_rows, start=1):
+                    call_id = str(row.get("call_id") or row.get("id") or "").strip()
+                    progress.set_item_progress(
+                        "archiving calls",
+                        row_index,
+                        len(new_call_rows),
+                        f"{row_index}/{len(new_call_rows)}",
+                    )
+                    await _archive_call_row(
+                        row,
+                        chunk_start,
+                        office_id,
+                        recordings_by_call_id.get(call_id, []),
+                        include_call_transcripts=not args.skip_call_transcripts,
+                        progress=progress,
+                    )
+                    counts["calls_archived"] += 1
+                    if _should_log_archive_progress(row_index, len(new_call_rows), progress_every):
+                        progress.log(
+                            f"[DIALPAD_BACKFILL] archive calls chunk {chunk_index}/{len(chunks)} "
+                            f"{row_index}/{len(new_call_rows)} complete "
+                            f"({counts['calls_archived']} cumulative archived)"
+                        )
+
+            progress.finish_chunk()
+            progress.log(
+                f"[DIALPAD_BACKFILL] chunk {chunk_index}/{len(chunks)} complete: "
+                f"calls={counts['calls_archived']} texts={counts['texts_archived']} "
+                f"voicemails={counts['voicemails_archived']} recordings={counts['recordings_rows']}"
+            )
+    finally:
+        progress.close()
 
     summary["counts"] = counts
+    summary["elapsed_seconds"] = int(monotonic() - progress.start_monotonic)
     return summary
 
 

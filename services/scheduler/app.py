@@ -60,7 +60,37 @@ async def _ping_loop():
         if online: _worker["last_seen"] = time.time()
         if was and not online:
             await _emit("WORKER_OFFLINE", {"local_worker_url":LOCAL_WORKER_URL,"error":err})
+        if (not was) and online:
+            replayed = await _requeue_deferred_jobs()
+            await _emit("WORKER_ONLINE", {
+                "local_worker_url": LOCAL_WORKER_URL,
+                "requeued_deferred_jobs": replayed,
+            })
         await asyncio.sleep(WORKER_PING_INTERVAL_SEC)
+
+
+async def _requeue_deferred_jobs() -> int:
+    if _pool is None:
+        return 0
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            UPDATE processing_jobs
+            SET state='QUEUED'::job_state
+            WHERE state='DEFERRED'::job_state
+            RETURNING job_uuid, job_type, contact_uuid, event_uuid
+            """
+        )
+        for row in rows:
+            await _emit_conn(conn, "DEFERRED_JOB_REQUEUED", {
+                "job_uuid": str(row["job_uuid"]),
+                "job_type": row["job_type"],
+                "contact_uuid": str(row["contact_uuid"]) if row["contact_uuid"] else None,
+                "event_uuid": str(row["event_uuid"]) if row["event_uuid"] else None,
+            })
+        if rows:
+            LOG.info("requeued %s deferred jobs after worker came online", len(rows))
+        return len(rows)
 
 async def decide_baseline_for_event(contact_uuid: Optional[str]) -> dict:
     if contact_uuid is None:

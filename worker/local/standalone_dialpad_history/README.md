@@ -11,10 +11,11 @@ It contains:
 
 ## Default Paths
 
-- Archive root: `Z:\Historical\Dialpad`
-- Contacts CSV: `Z:\Historical\Contacts\2026_0408_master_contacts_clean.csv`
+- Archive root: `D:\Talos_Data\Historical\Dialpad`
+- Contacts CSV: `D:\Talos_Data\Historical\Contacts\2026_0408_master_contacts_clean.csv`
 
-Both defaults can be changed in `.env`.
+Both defaults can be changed in `.env`. During recovery, make the local worker
+and these standalone tools point at the same local-disk root.
 
 ## Setup
 
