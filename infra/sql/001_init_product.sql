@@ -169,6 +169,19 @@ CREATE TABLE IF NOT EXISTS processing_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_runs_job ON processing_runs (job_uuid);
 
+CREATE TABLE IF NOT EXISTS dialpad_recovery_state (
+    recovery_key             TEXT PRIMARY KEY,
+    last_recovered_through   TIMESTAMPTZ,
+    last_run_started_at      TIMESTAMPTZ,
+    last_run_finished_at     TIMESTAMPTZ,
+    last_run_status          TEXT NOT NULL DEFAULT 'idle',
+    last_error               TEXT,
+    last_job_uuid            UUID REFERENCES processing_jobs(job_uuid) ON DELETE SET NULL,
+    last_payload             JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at               TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS transcripts (
     transcript_uuid UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     event_uuid      UUID NOT NULL REFERENCES communication_events(event_uuid) ON DELETE CASCADE,

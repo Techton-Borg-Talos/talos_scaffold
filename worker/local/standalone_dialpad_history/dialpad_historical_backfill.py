@@ -12,6 +12,7 @@ import csv
 import io
 import json
 import os
+import re
 import sys
 import textwrap
 from collections import defaultdict
@@ -32,6 +33,10 @@ DEFAULT_CHUNK_DAYS = 7
 DEFAULT_PROGRESS_EVERY = 10
 DEFAULT_TYPES = ("calls", "texts", "voicemails")
 PROGRESS_BAR_WIDTH = 24
+TEXTS_POLL_MAX = max(
+    ae.DIALPAD_STATS_POLL_MAX,
+    int(os.environ.get("DIALPAD_TEXTS_POLL_MAX", "24") or "24"),
+)
 
 
 def _format_elapsed(seconds: float) -> str:
@@ -320,16 +325,55 @@ def _deterministic_event_uuid(channel: str, external_id: str) -> str:
     return str(uuid5(NAMESPACE_URL, f"dialpad-historical:{channel}:{external_id}"))
 
 
-def _stats_target_candidates(target_type: Optional[str], target_id: Optional[str], office_id: str) -> List[tuple[str, str]]:
+def _stats_target_candidates(
+    target_type: Optional[str],
+    target_id: Optional[str],
+    office_id: str,
+    *,
+    stat_type: Optional[str] = None,
+) -> List[tuple[str, str]]:
+    include_related_targets = stat_type in {"texts", "calls", "voicemails", "recordings"}
     explicit_type = str(target_type or "").strip().lower()
     explicit_id = str(target_id or "").strip()
     if explicit_type and explicit_id:
-        return [(explicit_type, explicit_id)]
+        candidates: List[tuple[str, str]] = [(explicit_type, explicit_id)]
+        if include_related_targets:
+            if explicit_type != "office" and office_id:
+                candidates.append(("office", office_id))
+            user_id = os.environ.get("DIALPAD_USER_ID", "").strip()
+            if explicit_type != "user" and user_id:
+                candidates.append(("user", user_id))
+            if explicit_type != "company" and ae.DIALPAD_COMPANY_ID:
+                candidates.append(("company", ae.DIALPAD_COMPANY_ID))
+        deduped: List[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            deduped.append(candidate)
+        return deduped
 
     env_type = os.environ.get("DIALPAD_BACKFILL_TARGET_TYPE", "").strip().lower()
     env_id = os.environ.get("DIALPAD_BACKFILL_TARGET_ID", "").strip()
     if env_type and env_id:
-        return [(env_type, env_id)]
+        candidates: List[tuple[str, str]] = [(env_type, env_id)]
+        if include_related_targets:
+            if env_type != "office" and office_id:
+                candidates.append(("office", office_id))
+            user_id = os.environ.get("DIALPAD_USER_ID", "").strip()
+            if env_type != "user" and user_id:
+                candidates.append(("user", user_id))
+            if env_type != "company" and ae.DIALPAD_COMPANY_ID:
+                candidates.append(("company", ae.DIALPAD_COMPANY_ID))
+        deduped: List[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            deduped.append(candidate)
+        return deduped
 
     candidates: List[tuple[str, str]] = []
     if office_id:
@@ -356,21 +400,52 @@ def _stats_target_candidates(target_type: Optional[str], target_id: Optional[str
     )
 
 
-def _base_target_metadata(internal_number: Optional[str], office_id: str) -> Dict[str, Any]:
+def _row_target_type(row: Dict[str, Any]) -> str:
+    raw = str(
+        row.get("target_type")
+        or row.get("TargetKind")
+        or row.get("target_kind")
+        or os.environ.get("DIALPAD_BACKFILL_TARGET_ENTITY_TYPE", "user")
+        or "user"
+    ).strip()
+    lowered = raw.lower()
+    if lowered in {"userprofile", "user"}:
+        return "user"
+    if lowered == "office":
+        return "office"
+    if lowered == "company":
+        return "company"
+    return lowered or "user"
+
+
+def _row_target_id(row: Dict[str, Any]) -> Optional[str]:
+    return str(
+        row.get("target_id")
+        or row.get("TargetID")
+        or os.environ.get("DIALPAD_BACKFILL_TARGET_ENTITY_ID", "")
+        or ""
+    ).strip() or None
+
+
+def _base_target_metadata(internal_number: Optional[str], office_id: str, row: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    row = row or {}
+    target_type = _row_target_type(row)
+    target_id = _row_target_id(row)
     return {
-        "id": os.environ.get("DIALPAD_BACKFILL_TARGET_ENTITY_ID", "").strip() or None,
+        "id": target_id,
         "name": os.environ.get("DIALPAD_BACKFILL_TARGET_NAME", "").strip() or None,
-        "type": os.environ.get("DIALPAD_BACKFILL_TARGET_ENTITY_TYPE", "user").strip() or "user",
+        "type": target_type,
         "email": _normalize_email(os.environ.get("DIALPAD_BACKFILL_TARGET_EMAIL", "")),
         "phone": internal_number,
         "office_id": office_id,
     }
 
 
-def _contact_metadata(row: Dict[str, Any], external_number: Optional[str]) -> Dict[str, Any]:
+def _contact_metadata(row: Dict[str, Any], external_number: Optional[str], channel: str) -> Dict[str, Any]:
+    contact_name = row.get("contact_name") or None
     return {
         "id": str(row.get("contact_id") or row.get("message_id") or row.get("call_id") or "").strip() or None,
-        "name": row.get("contact_name") or row.get("name") or None,
+        "name": contact_name,
         "type": row.get("contact_type") or "historical",
         "email": _normalize_email(row.get("contact_email")),
         "phone": external_number,
@@ -378,21 +453,40 @@ def _contact_metadata(row: Dict[str, Any], external_number: Optional[str]) -> Di
 
 
 def _source_provenance(row: Dict[str, Any], channel: str, external_id: str, office_id: str) -> Dict[str, Any]:
+    direction = str(row.get("direction") or "").strip().lower() or None
+    from_number = _normalize_phone(row.get("from_phone"))
+    to_number = _normalize_phone(row.get("to_phone"))
+    raw_selected_caller_id = _normalize_phone(row.get("selected_caller_id"))
+    selected_caller_id = raw_selected_caller_id
     external_number = _normalize_phone(row.get("external_number") or row.get("from_phone"))
     internal_number = _normalize_phone(row.get("internal_number") or row.get("to_phone"))
+
+    if channel == "sms":
+        if direction in {"internal", "outbound", "sent"}:
+            internal_number = raw_selected_caller_id or from_number or internal_number
+            external_number = to_number or external_number or internal_number
+            selected_caller_id = raw_selected_caller_id or from_number or internal_number
+        else:
+            external_number = from_number or external_number
+            internal_number = to_number or internal_number or raw_selected_caller_id
+            selected_caller_id = raw_selected_caller_id or internal_number
+    else:
+        selected_caller_id = _normalize_phone(row.get("selected_caller_id") or row.get("internal_number"))
+
     return {
         "source_system": "dialpad",
         "capture_mode": "historical_backfill",
         "external_id": external_id,
         "call_id": str(row.get("call_id") or external_id or "").strip() or None,
         "channel": channel,
-        "direction": str(row.get("direction") or "").strip().lower() or None,
+        "direction": direction,
         "external_number": external_number,
         "internal_number": internal_number,
-        "from_number": _normalize_phone(row.get("from_phone")),
-        "selected_caller_id": _normalize_phone(row.get("selected_caller_id") or row.get("internal_number")),
-        "target": _base_target_metadata(internal_number, office_id),
-        "contact": _contact_metadata(row, external_number),
+        "from_number": from_number,
+        "to_number": to_number,
+        "selected_caller_id": selected_caller_id,
+        "target": _base_target_metadata(internal_number, office_id, row),
+        "contact": _contact_metadata(row, external_number, channel),
     }
 
 
@@ -470,6 +564,34 @@ def _flatten_transcript_payload(payload: Dict[str, Any]) -> Optional[str]:
     return joined or None
 
 
+def _extract_transcript_download_url(payload: Any) -> Optional[str]:
+    if isinstance(payload, str):
+        candidate = payload.strip()
+        if candidate.lower().startswith(("http://", "https://")):
+            return candidate
+        return None
+    if isinstance(payload, dict):
+        for key in ("download_url", "url", "file_url", "transcript_url", "csv_url"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip().lower().startswith(("http://", "https://")):
+                return value.strip()
+    return None
+
+
+def _looks_like_html_document(text: str) -> bool:
+    normalized = text.lstrip().lower()
+    return normalized.startswith("<!doctype html") or normalized.startswith("<html")
+
+
+def _decode_transcript_csv_bytes(content: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            return content.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return content.decode("utf-8", errors="replace")
+
+
 async def _fetch_csv_rows(
     *,
     stat_type: str,
@@ -479,6 +601,28 @@ async def _fetch_csv_rows(
     date_end: str,
     progress: Optional[_RunProgress] = None,
 ) -> List[Dict[str, str]]:
+    poll_max = TEXTS_POLL_MAX if stat_type == "texts" else ae.DIALPAD_STATS_POLL_MAX
+    request_body: Dict[str, Any] = {
+        "export_type": "records",
+        "stat_type": stat_type,
+        "target_type": target_type,
+        "target_id": target_id,
+        "timezone": ae.STATS_TIMEZONE_NAME,
+    }
+    try:
+        start_day = _parse_date(date_start)
+        end_day = _parse_date(date_end)
+    except Exception:
+        start_day = None
+        end_day = None
+    today_local = datetime.now(ae._archive_timezone()).date()
+    if start_day is not None and end_day is not None and end_day < today_local:
+        request_body["days_ago_start"] = (today_local - start_day).days
+        request_body["days_ago_end"] = (today_local - end_day).days
+    else:
+        request_body["date_start"] = date_start
+        request_body["date_end"] = date_end
+
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
         last_error: Optional[httpx.HTTPStatusError] = None
         for stats_timezone in ae._dialpad_stats_timezones():
@@ -491,15 +635,7 @@ async def _fetch_csv_rows(
                 "POST",
                 f"{ae.DIALPAD_API_BASE}/stats",
                 client=client,
-                json={
-                    "export_type": "records",
-                    "stat_type": stat_type,
-                    "target_type": target_type,
-                    "target_id": target_id,
-                    "date_start": date_start,
-                    "date_end": date_end,
-                    "timezone": stats_timezone,
-                },
+                json={**request_body, "timezone": stats_timezone},
                 headers={"Content-Type": "application/json"},
             )
             if response.is_error:
@@ -534,11 +670,11 @@ async def _fetch_csv_rows(
                     )
                 await asyncio.sleep(ae.DIALPAD_STATS_POLL_WAIT)
 
-            for poll_attempt in range(1, ae.DIALPAD_STATS_POLL_MAX + 1):
+            for poll_attempt in range(1, poll_max + 1):
                 if progress is not None:
                     progress.set_phase(
                         f"polling {stat_type} export",
-                        f"request_id={request_id} attempt {poll_attempt}/{ae.DIALPAD_STATS_POLL_MAX}",
+                        f"request_id={request_id} attempt {poll_attempt}/{poll_max}",
                     )
                 poll = await ae._dialpad_request(
                     "GET",
@@ -569,7 +705,7 @@ async def _fetch_csv_rows(
                     if progress is not None:
                         progress.log(
                             f"[DIALPAD_BACKFILL] {stat_type} export request {request_id} failed in Dialpad poll state '{state}'"
-                        )
+                      )
                     return []
                 if progress is not None:
                     progress.set_phase(
@@ -577,27 +713,76 @@ async def _fetch_csv_rows(
                         f"request_id={request_id} retry in {ae.DIALPAD_STATS_POLL_RETRY}s",
                     )
                 await asyncio.sleep(ae.DIALPAD_STATS_POLL_RETRY)
+            if progress is not None:
+                progress.log(
+                    f"[DIALPAD_BACKFILL] {stat_type} export request {request_id} "
+                    f"did not become downloadable after {poll_max} polls"
+                )
             return []
         if last_error is not None:
             raise last_error
     return []
 
 
-async def _fetch_call_transcript(call_id: str) -> Optional[str]:
+async def _fetch_call_transcript_artifacts(call_id: str) -> Dict[str, Any]:
+    artifacts: Dict[str, Any] = {
+        "provider_transcript_text": None,
+        "provider_transcript_payload": None,
+        "provider_transcript_csv_bytes": None,
+        "provider_transcript_source_mode": None,
+    }
     if not call_id:
-        return None
+        return artifacts
     async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-        response = await ae._dialpad_request(
-            "GET",
-            f"{ae.DIALPAD_API_BASE}/transcripts/{call_id}",
-            client=client,
-            retry_on_401=True,
-        )
-        if response.status_code in {403, 404}:
-            return None
-        response.raise_for_status()
-        body = response.json()
-    return _flatten_transcript_payload(body if isinstance(body, dict) else {})
+        try:
+            url_response = await ae._dialpad_request(
+                "GET",
+                f"{ae.DIALPAD_API_BASE}/transcripts/{call_id}/url",
+                client=client,
+                retry_on_401=True,
+            )
+            if url_response.status_code not in {403, 404}:
+                url_response.raise_for_status()
+                download_url = _extract_transcript_download_url(url_response.json())
+                if download_url:
+                    download = await ae._dialpad_request(
+                        "GET",
+                        download_url,
+                        client=client,
+                        retry_on_401=True,
+                    )
+                    download.raise_for_status()
+                    if download.content:
+                        raw_text = _decode_transcript_csv_bytes(download.content)
+                        if not _looks_like_html_document(raw_text):
+                            artifacts["provider_transcript_csv_bytes"] = download.content
+                            artifacts["provider_transcript_source_mode"] = "download_url"
+                            return artifacts
+        except Exception:
+            pass
+
+        try:
+            response = await ae._dialpad_request(
+                "GET",
+                f"{ae.DIALPAD_API_BASE}/transcripts/{call_id}",
+                client=client,
+                retry_on_401=True,
+            )
+            if response.status_code in {403, 404}:
+                return artifacts
+            response.raise_for_status()
+            body = response.json()
+        except Exception:
+            return artifacts
+
+    if isinstance(body, dict):
+        artifacts["provider_transcript_payload"] = body
+        artifacts["provider_transcript_text"] = _flatten_transcript_payload(body)
+        artifacts["provider_transcript_source_mode"] = "json_endpoint"
+    elif isinstance(body, str):
+        artifacts["provider_transcript_text"] = body.strip() or None
+        artifacts["provider_transcript_source_mode"] = "json_endpoint"
+    return artifacts
 
 
 def _occurred_at_for_row(channel: str, row: Dict[str, Any], fallback_day: date) -> datetime:
@@ -670,7 +855,13 @@ def _base_source_metadata(
     return payload
 
 
-async def _archive_sms_row(row: Dict[str, Any], fallback_day: date, office_id: str) -> Dict[str, Any]:
+async def _archive_sms_row(
+    row: Dict[str, Any],
+    fallback_day: date,
+    office_id: str,
+    *,
+    overwrite_archive: bool = False,
+) -> Dict[str, Any]:
     external_id = _row_external_id("sms", row)
     event_uuid = _deterministic_event_uuid("sms", external_id)
     occurred_at = _occurred_at_for_row("sms", row, fallback_day)
@@ -693,6 +884,7 @@ async def _archive_sms_row(row: Dict[str, Any], fallback_day: date, office_id: s
         "provider_transcript_text": None,
         "sms_text": sms_text,
         "recording_references": [],
+        "overwrite_archive": overwrite_archive,
     }
     job = {
         "job_uuid": str(uuid4()),
@@ -740,16 +932,27 @@ async def _archive_voicemail_row(
             )
         )
     provider_transcript_text = str(row.get("transcription_text") or "").strip() or None
-    if not provider_transcript_text and external_id:
+    provider_transcript_payload = None
+    provider_transcript_csv_bytes = None
+    provider_transcript_source_mode = "stats_row" if provider_transcript_text else None
+    if external_id:
         try:
             if progress is not None:
                 progress.set_phase(
                     "fetching voicemail transcript",
                     str(row.get("name") or row.get("external_number") or external_id),
                 )
-            provider_transcript_text = await _fetch_call_transcript(external_id)
+            transcript_artifacts = await _fetch_call_transcript_artifacts(external_id)
+            provider_transcript_text = (
+                transcript_artifacts.get("provider_transcript_text") or provider_transcript_text
+            )
+            provider_transcript_payload = transcript_artifacts.get("provider_transcript_payload")
+            provider_transcript_csv_bytes = transcript_artifacts.get("provider_transcript_csv_bytes")
+            provider_transcript_source_mode = (
+                transcript_artifacts.get("provider_transcript_source_mode") or provider_transcript_source_mode
+            )
         except Exception:
-            provider_transcript_text = None
+            pass
     payload = {
         "event_uuid": event_uuid,
         "channel": "voicemail",
@@ -769,6 +972,9 @@ async def _archive_voicemail_row(
             },
         ),
         "provider_transcript_text": provider_transcript_text,
+        "provider_transcript_payload": provider_transcript_payload,
+        "provider_transcript_csv_bytes": provider_transcript_csv_bytes,
+        "provider_transcript_source_mode": provider_transcript_source_mode,
         "sms_text": None,
         "recording_references": recording_refs,
     }
@@ -818,6 +1024,9 @@ async def _archive_call_row(
             )
         )
     provider_transcript_text = None
+    provider_transcript_payload = None
+    provider_transcript_csv_bytes = None
+    provider_transcript_source_mode = None
     if include_call_transcripts and not str(row.get("category") or "").strip().lower().startswith("missed"):
         try:
             if progress is not None:
@@ -825,9 +1034,13 @@ async def _archive_call_row(
                     "fetching call transcript",
                     str(row.get("contact_name") or row.get("name") or row.get("external_number") or external_id),
                 )
-            provider_transcript_text = await _fetch_call_transcript(external_id)
+            transcript_artifacts = await _fetch_call_transcript_artifacts(external_id)
+            provider_transcript_text = transcript_artifacts.get("provider_transcript_text")
+            provider_transcript_payload = transcript_artifacts.get("provider_transcript_payload")
+            provider_transcript_csv_bytes = transcript_artifacts.get("provider_transcript_csv_bytes")
+            provider_transcript_source_mode = transcript_artifacts.get("provider_transcript_source_mode")
         except Exception:
-            provider_transcript_text = None
+            pass
     payload = {
         "event_uuid": event_uuid,
         "channel": "call",
@@ -846,6 +1059,9 @@ async def _archive_call_row(
             },
         ),
         "provider_transcript_text": provider_transcript_text,
+        "provider_transcript_payload": provider_transcript_payload,
+        "provider_transcript_csv_bytes": provider_transcript_csv_bytes,
+        "provider_transcript_source_mode": provider_transcript_source_mode,
         "sms_text": None,
         "recording_references": recording_refs,
     }
@@ -870,12 +1086,14 @@ async def _fetch_rows_for_chunk(
     chunk_end: date,
     target_candidates: List[tuple[str, str]],
     progress: Optional[_RunProgress] = None,
+    merge_all_candidates: bool = False,
 ) -> List[Dict[str, str]]:
     chunk_rows: List[Dict[str, str]] = []
+    merged_rows: List[Dict[str, str]] = []
     last_error: Optional[Exception] = None
-    for candidate_type, candidate_id in target_candidates:
+    for candidate_index, (candidate_type, candidate_id) in enumerate(target_candidates, start=1):
         try:
-            chunk_rows = await _fetch_csv_rows(
+            candidate_rows = await _fetch_csv_rows(
                 stat_type=stat_type,
                 target_type=candidate_type,
                 target_id=candidate_id,
@@ -883,6 +1101,24 @@ async def _fetch_rows_for_chunk(
                 date_end=chunk_end.isoformat(),
                 progress=progress,
             )
+            raw_min_day, raw_max_day = _rows_local_day_range(stat_type, candidate_rows)
+            if (
+                candidate_rows
+                and raw_min_day is not None
+                and raw_max_day is not None
+                and (raw_min_day > chunk_end or raw_max_day < chunk_start)
+                and candidate_index < len(target_candidates)
+            ):
+                message = (
+                    f"[DIALPAD_BACKFILL] {stat_type} target {candidate_type}:{candidate_id} returned "
+                    f"rows only for {raw_min_day.isoformat()} -> {raw_max_day.isoformat()} while requesting "
+                    f"{chunk_start.isoformat()} -> {chunk_end.isoformat()}; trying next target"
+                )
+                if progress is not None:
+                    progress.log(message)
+                else:
+                    print(message)
+                continue
             message = (
                 f"[DIALPAD_BACKFILL] {stat_type} chunk {chunk_start.isoformat()} -> {chunk_end.isoformat()} "
                 f"used target {candidate_type}:{candidate_id}"
@@ -891,19 +1127,29 @@ async def _fetch_rows_for_chunk(
                 progress.log(message)
             else:
                 print(message)
+            if merge_all_candidates:
+                merged_rows.extend(candidate_rows)
+                continue
+            chunk_rows = candidate_rows
             break
-        except httpx.HTTPStatusError as exc:
+        except httpx.HTTPError as exc:
             last_error = exc
-            status = exc.response.status_code if exc.response is not None else "unknown"
+            if isinstance(exc, httpx.HTTPStatusError):
+                status = exc.response.status_code if exc.response is not None else "unknown"
+                detail = f"HTTP {status}"
+            else:
+                detail = exc.__class__.__name__
             message = (
                 f"[DIALPAD_BACKFILL] {stat_type} target {candidate_type}:{candidate_id} failed "
-                f"with HTTP {status}; trying next target"
+                f"with {detail}; trying next target"
             )
             if progress is not None:
                 progress.log(message)
             else:
                 print(message)
             continue
+    if merge_all_candidates:
+        chunk_rows = merged_rows
     if not chunk_rows and last_error is not None:
         raise last_error
 
@@ -957,6 +1203,12 @@ async def _fetch_rows_for_chunk(
 async def run_backfill(args: argparse.Namespace) -> Dict[str, Any]:
     office_id = args.office_id or os.environ.get("DIALPAD_OFFICE_ID", DEFAULT_OFFICE_ID).strip()
     target_candidates = _stats_target_candidates(args.target_type, args.target_id, office_id)
+    text_target_candidates = _stats_target_candidates(
+        args.target_type,
+        args.target_id,
+        office_id,
+        stat_type="texts",
+    )
     start_day = _parse_date(args.start_date)
     end_day = _parse_date(args.end_date) if args.end_date else datetime.now(ae._archive_timezone()).date()
     chunk_days = max(1, args.chunk_days)
@@ -1013,8 +1265,9 @@ async def run_backfill(args: argparse.Namespace) -> Dict[str, Any]:
                     stat_type="texts",
                     chunk_start=chunk_start,
                     chunk_end=chunk_end,
-                    target_candidates=target_candidates,
+                    target_candidates=text_target_candidates,
                     progress=progress,
+                    merge_all_candidates=True,
                 )
                 new_text_rows: List[Dict[str, str]] = []
                 duplicate_texts = 0
@@ -1038,7 +1291,12 @@ async def run_backfill(args: argparse.Namespace) -> Dict[str, Any]:
                         len(new_text_rows),
                         f"{row_index}/{len(new_text_rows)}",
                     )
-                    await _archive_sms_row(row, chunk_start, office_id)
+                    await _archive_sms_row(
+                        row,
+                        chunk_start,
+                        office_id,
+                        overwrite_archive=args.overwrite,
+                    )
                     counts["texts_archived"] += 1
                     if _should_log_archive_progress(row_index, len(new_text_rows), progress_every):
                         progress.log(
@@ -1049,12 +1307,19 @@ async def run_backfill(args: argparse.Namespace) -> Dict[str, Any]:
 
             if "voicemails" in requested_types:
                 progress.set_phase("fetching voicemails export", f"chunk {chunk_index}/{len(chunks)}")
+                voicemail_target_candidates = _stats_target_candidates(
+                    target_type=args.target_type,
+                    target_id=args.target_id,
+                    office_id=office_id,
+                    stat_type="voicemails",
+                )
                 voicemail_rows = await _fetch_rows_for_chunk(
                     stat_type="voicemails",
                     chunk_start=chunk_start,
                     chunk_end=chunk_end,
-                    target_candidates=target_candidates,
+                    target_candidates=voicemail_target_candidates,
                     progress=progress,
+                    merge_all_candidates=True,
                 )
                 new_voicemail_rows: List[Dict[str, str]] = []
                 duplicate_voicemails = 0
@@ -1089,12 +1354,19 @@ async def run_backfill(args: argparse.Namespace) -> Dict[str, Any]:
 
             if "calls" in requested_types:
                 progress.set_phase("fetching recordings export", f"chunk {chunk_index}/{len(chunks)}")
+                recording_target_candidates = _stats_target_candidates(
+                    target_type=args.target_type,
+                    target_id=args.target_id,
+                    office_id=office_id,
+                    stat_type="recordings",
+                )
                 recording_rows = await _fetch_rows_for_chunk(
                     stat_type="recordings",
                     chunk_start=chunk_start,
                     chunk_end=chunk_end,
-                    target_candidates=target_candidates,
+                    target_candidates=recording_target_candidates,
                     progress=progress,
+                    merge_all_candidates=True,
                 )
                 new_recording_rows: List[Dict[str, str]] = []
                 duplicate_recordings = 0
@@ -1117,12 +1389,19 @@ async def run_backfill(args: argparse.Namespace) -> Dict[str, Any]:
                 )
 
                 progress.set_phase("fetching calls export", f"chunk {chunk_index}/{len(chunks)}")
+                call_target_candidates = _stats_target_candidates(
+                    target_type=args.target_type,
+                    target_id=args.target_id,
+                    office_id=office_id,
+                    stat_type="calls",
+                )
                 call_rows = await _fetch_rows_for_chunk(
                     stat_type="calls",
                     chunk_start=chunk_start,
                     chunk_end=chunk_end,
-                    target_candidates=target_candidates,
+                    target_candidates=call_target_candidates,
                     progress=progress,
+                    merge_all_candidates=True,
                 )
                 new_call_rows: List[Dict[str, str]] = []
                 duplicate_calls = 0
@@ -1202,6 +1481,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-call-transcripts",
         action="store_true",
         help="Skip best-effort GET /transcripts/{call_id} lookups for call AI transcripts.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="If an event folder already exists, delete the entire folder and rebuild it from scratch.",
     )
     return parser
 

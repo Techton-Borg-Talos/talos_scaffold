@@ -9,6 +9,7 @@ import mimetypes
 import os
 import re
 import shlex
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -132,7 +133,51 @@ def _company_slug(source_provenance: Dict[str, Any]) -> str:
     return COMPANY_FALLBACK
 
 
+def _normalized_sms_provenance(source_provenance: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(source_provenance, dict):
+        return {}
+    if str(source_provenance.get("channel") or "").strip().lower() != "sms":
+        return source_provenance
+
+    normalized = dict(source_provenance)
+    contact = dict(normalized.get("contact") or {})
+    target = dict(normalized.get("target") or {})
+    direction = str(normalized.get("direction") or "").strip().lower()
+    external_number = str(normalized.get("external_number") or "").strip()
+    internal_number = str(normalized.get("internal_number") or "").strip()
+    from_number = str(normalized.get("from_number") or "").strip()
+    to_number = str(normalized.get("to_number") or "").strip()
+    selected_caller_id = str(normalized.get("selected_caller_id") or "").strip()
+
+    if direction in {"internal", "outbound", "sent"}:
+        target_phone = str(target.get("phone") or "").strip() or selected_caller_id or from_number or internal_number
+        contact_phone = str(contact.get("phone") or "").strip() or external_number or to_number or internal_number
+        if from_number and contact_phone == from_number and target_phone != from_number:
+            target_phone = selected_caller_id or from_number or target_phone
+            contact_phone = to_number or internal_number or contact_phone
+        if contact_phone and target_phone and contact_phone == target_phone:
+            contact_phone = to_number or internal_number or contact_phone
+        normalized["internal_number"] = target_phone
+        normalized["external_number"] = contact_phone
+    else:
+        contact_phone = str(contact.get("phone") or "").strip() or external_number or from_number
+        target_phone = str(target.get("phone") or "").strip() or internal_number or to_number or selected_caller_id
+        if contact_phone and target_phone and contact_phone == target_phone:
+            target_phone = to_number or internal_number or target_phone
+        normalized["external_number"] = contact_phone
+        normalized["internal_number"] = target_phone
+
+    if normalized.get("external_number"):
+        contact["phone"] = normalized["external_number"]
+    if normalized.get("internal_number"):
+        target["phone"] = normalized["internal_number"]
+    normalized["contact"] = contact
+    normalized["target"] = target
+    return normalized
+
+
 def _conversation_number(source_provenance: Dict[str, Any]) -> str:
+    source_provenance = _normalized_sms_provenance(source_provenance)
     target = source_provenance.get("target") or {}
     contact = source_provenance.get("contact") or {}
     return (
@@ -191,6 +236,7 @@ def _display_party(
 
 
 def _contact_display(source_provenance: Dict[str, Any], default: Optional[str] = None) -> Optional[str]:
+    source_provenance = _normalized_sms_provenance(source_provenance)
     contact = source_provenance.get("contact") or {}
     return _display_party(
         contact,
@@ -201,6 +247,7 @@ def _contact_display(source_provenance: Dict[str, Any], default: Optional[str] =
 
 
 def _target_display(source_provenance: Dict[str, Any], default: Optional[str] = None) -> Optional[str]:
+    source_provenance = _normalized_sms_provenance(source_provenance)
     target = source_provenance.get("target") or {}
     return _display_party(
         target,
@@ -214,20 +261,25 @@ def _render_sms_text(payload: Dict[str, Any], sms_text: str) -> Optional[str]:
     body = str(sms_text or "").strip()
     if not body:
         return None
+    occurred_at = _parse_occurred_at(payload.get("occurred_at"))
+    time_display = occurred_at.astimezone(_archive_timezone()).strftime("%Y-%m-%d %H:%M:%S %Z")
     if body.startswith("From: ") and "\nTo: " in body:
-        return body
+        if body.startswith("Time: "):
+            return body
+        return f"Time: {time_display}\n{body}"
 
     source_provenance = payload.get("source_provenance") or {}
     direction = str(source_provenance.get("direction") or payload.get("direction") or "").strip().lower()
     contact_display = _contact_display(source_provenance, default="Unknown") or "Unknown"
     target_display = _target_display(source_provenance, default="Unknown") or "Unknown"
-    if direction in {"outbound", "sent"}:
+    if direction in {"internal", "outbound", "sent"}:
         sender_display = target_display
         recipient_display = contact_display
     else:
         sender_display = contact_display
         recipient_display = target_display
     return (
+        f"Time: {time_display}\n"
         f"From: {sender_display}\n"
         f"To: {recipient_display}\n"
         f"{sender_display} -> {recipient_display}:\n\n"
@@ -362,7 +414,9 @@ def _render_transcript_segments(segments: List[Dict[str, str]]) -> str:
         if not content:
             continue
         rendered_speaker = str(segment.get("rendered_speaker") or "").strip()
-        rendered.append(f"{rendered_speaker}: {content}" if rendered_speaker else content)
+        timestamp = str(segment.get("timestamp") or "").strip()
+        prefix = f"[{timestamp}] " if timestamp else ""
+        rendered.append(f"{prefix}{rendered_speaker}: {content}" if rendered_speaker else f"{prefix}{content}")
     return "\n".join(rendered).strip()
 
 
@@ -385,6 +439,7 @@ def _transcript_segments_from_text(text: str) -> List[Dict[str, str]]:
                     "speaker_label": speaker_label,
                     "speaker_name": speaker_name,
                     "rendered_speaker": rendered_speaker,
+                    "timestamp": "",
                     "text": content,
                 }
             )
@@ -397,6 +452,7 @@ def _transcript_segments_from_text(text: str) -> List[Dict[str, str]]:
                 "speaker_label": speaker_label,
                 "speaker_name": speaker_name,
                 "rendered_speaker": "",
+                "timestamp": "",
                 "text": normalized,
             }
         ]
@@ -405,13 +461,18 @@ def _transcript_segments_from_text(text: str) -> List[Dict[str, str]]:
 
 def _write_transcript_csv(path: Path, text: str) -> int:
     segments = _transcript_segments_from_text(text)
+    return _write_transcript_segments_csv(path, segments)
+
+
+def _write_transcript_segments_csv(path: Path, segments: List[Dict[str, str]]) -> int:
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["line_number", "speaker_label", "speaker_name", "rendered_speaker", "text"])
+        writer.writerow(["line_number", "timestamp", "speaker_label", "speaker_name", "rendered_speaker", "text"])
         for segment in segments:
             writer.writerow(
                 [
                     segment["line_number"],
+                    segment.get("timestamp", ""),
                     segment["speaker_label"],
                     segment["speaker_name"],
                     segment["rendered_speaker"],
@@ -419,6 +480,168 @@ def _write_transcript_csv(path: Path, text: str) -> int:
                 ]
             )
     return path.stat().st_size
+
+
+def _decode_transcript_csv_bytes(content: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            return content.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return content.decode("utf-8", errors="replace")
+
+
+def _looks_like_html_document(text: str) -> bool:
+    normalized = text.lstrip().lower()
+    return normalized.startswith("<!doctype html") or normalized.startswith("<html")
+
+
+def _transcript_segments_from_csv_text(
+    text: str,
+    *,
+    fallback_speaker: Optional[str],
+    assume_two_party: bool,
+) -> List[Dict[str, str]]:
+    reader = csv.DictReader(io.StringIO(text.lstrip("\ufeff")))
+    if not reader.fieldnames:
+        return []
+
+    segments: List[Dict[str, str]] = []
+    for index, raw_row in enumerate(reader, start=1):
+        normalized_row = {
+            _normalized_lookup_key(str(key or "")): value
+            for key, value in raw_row.items()
+            if str(key or "").strip()
+        }
+        line_type = str(
+            normalized_row.get("type")
+            or normalized_row.get("linetype")
+            or normalized_row.get("segmenttype")
+            or ""
+        ).strip().lower()
+        if line_type and line_type not in {"transcript", "utterance", "segment", "line"}:
+            continue
+
+        content = _clean_text_candidate(
+            normalized_row.get("content")
+            or normalized_row.get("text")
+            or normalized_row.get("transcript")
+            or normalized_row.get("body")
+            or normalized_row.get("utterance")
+            or normalized_row.get("line")
+            or normalized_row.get("message")
+        )
+        if not content:
+            continue
+
+        speaker_name = _clean_text_candidate(
+            normalized_row.get("speakername")
+            or normalized_row.get("name")
+            or normalized_row.get("speakerdisplayname")
+            or normalized_row.get("participantname")
+        ) or fallback_speaker
+        speaker_label = (
+            normalized_row.get("speakerlabel")
+            or normalized_row.get("speakerid")
+            or normalized_row.get("speakernumber")
+            or normalized_row.get("speaker")
+            or normalized_row.get("participant")
+        )
+        timestamp = _clean_text_candidate(
+            normalized_row.get("time")
+            or normalized_row.get("timestamp")
+            or normalized_row.get("starttime")
+            or normalized_row.get("start")
+            or normalized_row.get("begintime")
+            or normalized_row.get("utterancetime")
+        ) or ""
+        rendered_speaker = _render_speaker_display(speaker_name, speaker_label)
+        segments.append(
+            {
+                "line_number": str(
+                    normalized_row.get("linenumber")
+                    or normalized_row.get("line")
+                    or normalized_row.get("index")
+                    or index
+                ),
+                "speaker_label": str(_normalize_speaker_label(speaker_label) or ""),
+                "speaker_name": str(speaker_name or ""),
+                "rendered_speaker": rendered_speaker,
+                "timestamp": timestamp,
+                "text": content,
+            }
+        )
+
+    return _apply_speaker_turn_heuristic(
+        segments,
+        assume_two_party=assume_two_party,
+        fallback_speaker=fallback_speaker,
+    )
+
+
+def _render_transcript_from_csv_bytes(
+    content: bytes,
+    *,
+    fallback_speaker: Optional[str],
+    assume_two_party: bool,
+) -> tuple[Optional[str], List[Dict[str, str]]]:
+    transcript_csv_text = _decode_transcript_csv_bytes(content)
+    segments = _transcript_segments_from_csv_text(
+        transcript_csv_text,
+        fallback_speaker=fallback_speaker,
+        assume_two_party=assume_two_party,
+    )
+    rendered = _render_transcript_segments(segments)
+    return rendered or None, segments
+
+
+def _provider_transcript_json_payload(
+    payload: Dict[str, Any],
+    *,
+    event_uuid: str,
+    source_mode: Optional[str],
+    rendered_text: Optional[str],
+    segments: List[Dict[str, str]],
+    fallback_speaker: Optional[str],
+) -> Dict[str, Any]:
+    transcript_segments = segments or _transcript_segments_from_text(str(rendered_text or ""))
+    normalized_segments: List[Dict[str, Any]] = []
+    for index, segment in enumerate(transcript_segments, start=1):
+        content = str(segment.get("text") or "").strip()
+        if not content:
+            continue
+        speaker_name = str(segment.get("speaker_name") or "").strip() or None
+        speaker_label = str(segment.get("speaker_label") or "").strip() or None
+        rendered_speaker = str(segment.get("rendered_speaker") or "").strip() or None
+        timestamp = str(segment.get("timestamp") or "").strip() or None
+        normalized_segments.append(
+            {
+                "line_number": index,
+                "timestamp": timestamp,
+                "speaker_name": speaker_name,
+                "speaker_label": speaker_label,
+                "rendered_speaker": rendered_speaker,
+                "speaker_identity_locked": False,
+                "speaker_name_source": "provider_or_heuristic" if (speaker_name or speaker_label) else "unknown",
+                "text": content,
+            }
+        )
+    return {
+        "event_uuid": event_uuid,
+        "channel": _archive_channel(payload),
+        "provider": "dialpad",
+        "source_mode": source_mode,
+        "speaker_identity_locked": False,
+        "speaker_identity_note": (
+            "Speaker names are provisional hints from Dialpad/provider data or archive heuristics "
+            "until voice fingerprints are trained."
+        ),
+        "fallback_speaker": fallback_speaker,
+        "contact_display": _contact_display(payload.get("source_provenance") or {}),
+        "target_display": _target_display(payload.get("source_provenance") or {}),
+        "rendered_text": str(rendered_text or "").strip() or None,
+        "segments": normalized_segments,
+    }
 
 
 def _write_json(path: Path, payload: Dict[str, Any]) -> int:
@@ -625,6 +848,14 @@ def _infer_manifest_entry(
         metadata["file_role"] = "provider_transcript_csv"
         metadata["provider"] = "dialpad"
         content_type = "text/csv"
+    elif path.name.endswith("_provider_transcript.json"):
+        metadata["file_role"] = "provider_transcript_json"
+        metadata["provider"] = "dialpad"
+        content_type = "application/json"
+    elif path.name.endswith("_provider_transcript_normalized.csv"):
+        metadata["file_role"] = "provider_transcript_csv_normalized"
+        metadata["provider"] = "dialpad"
+        content_type = "text/csv"
     elif path.name.endswith("_provider_summary.txt"):
         metadata["file_role"] = "provider_summary"
         metadata["provider"] = "dialpad"
@@ -718,6 +949,21 @@ def _find_existing_archive_dir(phone_channel_root: Path, event_uuid: str, extern
         if external_id and payload.get("external_id") == external_id:
             return metadata_path.parent
     return None
+
+
+def _find_matching_archive_dirs(event_uuid: str, external_id: str) -> List[Path]:
+    matches: List[Path] = []
+    if not ARCHIVE_ROOT.exists():
+        return matches
+    for metadata_path in sorted(ARCHIVE_ROOT.rglob("*_metadata.json")):
+        payload = _load_json_file(metadata_path)
+        if not payload:
+            continue
+        if payload.get("event_uuid") == event_uuid or (external_id and payload.get("external_id") == external_id):
+            archive_dir = metadata_path.parent
+            if archive_dir not in matches:
+                matches.append(archive_dir)
+    return matches
 
 
 def _existing_event_stem(archive_dir: Path) -> Optional[str]:
@@ -936,6 +1182,35 @@ def _dedupe_candidates(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     return [deduped_by_key[key] for key in ordered_keys]
 
 
+def _channel_supports_dialpad_enrichment(payload: Dict[str, Any]) -> bool:
+    return _archive_channel(payload) in {"call", "voicemail"}
+
+
+def _log_optional_dialpad_lookup(
+    lookup_kind: str,
+    call_id: str,
+    *,
+    response: Optional[httpx.Response] = None,
+    error: Optional[Exception] = None,
+) -> None:
+    status = response.status_code if response is not None else "unknown"
+    if error is not None:
+        LOG.info(
+            "dialpad optional lookup skipped: kind=%s call_id=%s status=%s error=%s",
+            lookup_kind,
+            call_id or "unknown",
+            status,
+            str(error),
+        )
+        return
+    LOG.info(
+        "dialpad optional lookup skipped: kind=%s call_id=%s status=%s",
+        lookup_kind,
+        call_id or "unknown",
+        status,
+    )
+
+
 def _call_id_for_payload(payload: Dict[str, Any]) -> str:
     source_metadata = payload.get("source_metadata") or {}
     source_provenance = payload.get("source_provenance") or {}
@@ -954,7 +1229,7 @@ def _inferred_transcript_speaker(payload: Dict[str, Any]) -> Optional[str]:
     if channel == "voicemail":
         if direction in {"outbound", "sent", "internal"}:
             return _target_display(source_provenance)
-        return _contact_display(source_provenance)
+        return str(source_provenance.get("external_number") or "").strip() or None
     return None
 
 
@@ -969,10 +1244,10 @@ def _structured_transcript_lines(candidate: Any) -> List[Dict[str, Any]]:
     return []
 
 
-def _render_structured_transcript(candidate: Any, fallback_speaker: Optional[str]) -> Optional[str]:
+def _structured_transcript_segments(candidate: Any, fallback_speaker: Optional[str]) -> List[Dict[str, str]]:
     lines = _structured_transcript_lines(candidate)
     if not lines:
-        return None
+        return []
     segments: List[Dict[str, str]] = []
     for index, line in enumerate(lines, start=1):
         line_type = str(line.get("type") or "").strip().lower()
@@ -985,6 +1260,13 @@ def _render_structured_transcript(candidate: Any, fallback_speaker: Optional[str
             continue
         speaker_name = _clean_text_candidate(line.get("speaker_name") or line.get("name")) or fallback_speaker
         speaker_label = line.get("speaker_label") or line.get("speaker") or line.get("speaker_id")
+        timestamp = _clean_text_candidate(
+            line.get("time")
+            or line.get("timestamp")
+            or line.get("start_time")
+            or line.get("start")
+            or line.get("utterance_time")
+        ) or ""
         if not speaker_label and fallback_speaker:
             speaker_label = "Speaker 1"
         rendered_speaker = _render_speaker_display(speaker_name, speaker_label)
@@ -994,14 +1276,19 @@ def _render_structured_transcript(candidate: Any, fallback_speaker: Optional[str
                 "speaker_label": str(_normalize_speaker_label(speaker_label) or ""),
                 "speaker_name": str(speaker_name or ""),
                 "rendered_speaker": rendered_speaker,
+                "timestamp": timestamp,
                 "text": content,
             }
         )
-    segments = _apply_speaker_turn_heuristic(
+    return _apply_speaker_turn_heuristic(
         segments,
         assume_two_party=True,
         fallback_speaker=fallback_speaker,
     )
+
+
+def _render_structured_transcript(candidate: Any, fallback_speaker: Optional[str]) -> Optional[str]:
+    segments = _structured_transcript_segments(candidate, fallback_speaker)
     rendered = _render_transcript_segments(segments)
     return rendered or None
 
@@ -1009,6 +1296,24 @@ def _render_structured_transcript(candidate: Any, fallback_speaker: Optional[str
 def _looks_like_labeled_transcript(text: str) -> bool:
     first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
     return bool(re.match(r"^[^:\n]{1,200}:\s+\S", first_line))
+
+
+def _extract_transcript_download_url(payload: Any) -> Optional[str]:
+    if isinstance(payload, str):
+        candidate = payload.strip()
+        if candidate.lower().startswith(("http://", "https://")):
+            return candidate
+        return None
+    return _first_text_candidate(
+        payload,
+        (
+            "download_url",
+            "url",
+            "file_url",
+            "transcript_url",
+            "csv_url",
+        ),
+    )
 
 
 def _provider_transcript_text(payload: Dict[str, Any], call_detail: Optional[Dict[str, Any]] = None) -> Optional[str]:
@@ -1056,6 +1361,166 @@ def _provider_transcript_text(payload: Dict[str, Any], call_detail: Optional[Dic
                 )
             return _render_transcript_segments(transcript_segments)
     return None
+
+
+async def _provider_transcript_artifacts_enriched(
+    payload: Dict[str, Any],
+    call_detail: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    fallback_speaker = _inferred_transcript_speaker(payload)
+    channel = _archive_channel(payload)
+    assume_two_party = channel == "call"
+    artifacts: Dict[str, Any] = {
+        "rendered_text": None,
+        "normalized_segments": [],
+        "raw_csv_bytes": None,
+        "raw_csv_content_type": None,
+        "source_mode": None,
+    }
+
+    if not _channel_supports_dialpad_enrichment(payload):
+        direct = _provider_transcript_text(payload, call_detail)
+        if direct:
+            artifacts["rendered_text"] = direct
+            artifacts["normalized_segments"] = _transcript_segments_from_text(direct)
+            artifacts["source_mode"] = "embedded_payload"
+        return artifacts
+
+    call_id = _call_id_for_payload(payload)
+    if call_id and (DIALPAD_ACCESS_TOKEN or DIALPAD_REFRESH_TOKEN):
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            try:
+                url_response = await _dialpad_request(
+                    "GET",
+                    f"{DIALPAD_API_BASE}/transcripts/{call_id}/url",
+                    client=client,
+                    retry_on_401=True,
+                )
+                if url_response.status_code in {400, 401, 403, 404}:
+                    _log_optional_dialpad_lookup("transcript_url", call_id, response=url_response)
+                else:
+                    url_response.raise_for_status()
+                    download_url = _extract_transcript_download_url(url_response.json())
+                    if download_url:
+                        download_response = await _dialpad_request(
+                            "GET",
+                            download_url,
+                            client=client,
+                            retry_on_401=True,
+                        )
+                        download_response.raise_for_status()
+                        raw_csv_bytes = download_response.content
+                        if raw_csv_bytes:
+                            raw_csv_text = _decode_transcript_csv_bytes(raw_csv_bytes)
+                            if _looks_like_html_document(raw_csv_text):
+                                raw_csv_bytes = b""
+                            else:
+                                rendered_text, normalized_segments = _render_transcript_from_csv_bytes(
+                                    raw_csv_bytes,
+                                    fallback_speaker=fallback_speaker,
+                                    assume_two_party=assume_two_party,
+                                )
+                                artifacts.update(
+                                    {
+                                        "raw_csv_bytes": raw_csv_bytes,
+                                        "raw_csv_content_type": download_response.headers.get("content-type") or "text/csv",
+                                        "source_mode": "download_url",
+                                        "rendered_text": rendered_text,
+                                        "normalized_segments": normalized_segments,
+                                    }
+                                )
+                                if rendered_text:
+                                    return artifacts
+            except httpx.HTTPStatusError as exc:
+                if exc.response is not None and exc.response.status_code in {400, 401, 403, 404}:
+                    _log_optional_dialpad_lookup("transcript_url", call_id, response=exc.response, error=exc)
+                else:
+                    LOG.warning("dialpad transcript_url lookup failed for call_id=%s: %s", call_id, exc)
+            except Exception as exc:
+                LOG.info("dialpad transcript_url lookup skipped for call_id=%s: %s", call_id, exc)
+
+            try:
+                response = await _dialpad_request(
+                    "GET",
+                    f"{DIALPAD_API_BASE}/transcripts/{call_id}",
+                    client=client,
+                    retry_on_401=True,
+                )
+                if response.status_code in {400, 401, 403, 404}:
+                    _log_optional_dialpad_lookup("transcript_json", call_id, response=response)
+                else:
+                    response.raise_for_status()
+                    transcript_payload = response.json()
+                    rendered = None
+                    normalized_segments: List[Dict[str, str]] = []
+                    if isinstance(transcript_payload, dict):
+                        normalized_segments = _structured_transcript_segments(transcript_payload, fallback_speaker)
+                        rendered = _render_structured_transcript(transcript_payload, fallback_speaker)
+                        if not rendered:
+                            text = _first_text_candidate(
+                                transcript_payload,
+                                (
+                                    "transcription_text",
+                                    "transcript_text",
+                                    "transcript",
+                                    "transcription",
+                                    "full_transcript",
+                                    "text",
+                                ),
+                            )
+                            if text:
+                                normalized_segments = _apply_speaker_turn_heuristic(
+                                    _transcript_segments_from_text(text),
+                                    assume_two_party=assume_two_party,
+                                    fallback_speaker=fallback_speaker,
+                                )
+                                if len(normalized_segments) == 1:
+                                    normalized_segments[0]["speaker_name"] = normalized_segments[0].get("speaker_name") or str(fallback_speaker or "")
+                                    normalized_segments[0]["speaker_label"] = normalized_segments[0].get("speaker_label") or (
+                                        "Speaker 1" if fallback_speaker else "Unknown Speaker"
+                                    )
+                                    normalized_segments[0]["rendered_speaker"] = _render_speaker_display(
+                                        normalized_segments[0]["speaker_name"],
+                                        normalized_segments[0]["speaker_label"],
+                                    )
+                                rendered = _render_transcript_segments(normalized_segments)
+                    elif isinstance(transcript_payload, str):
+                        normalized_segments = _apply_speaker_turn_heuristic(
+                            _transcript_segments_from_text(transcript_payload),
+                            assume_two_party=assume_two_party,
+                            fallback_speaker=fallback_speaker,
+                        )
+                        if len(normalized_segments) == 1:
+                            normalized_segments[0]["speaker_name"] = normalized_segments[0].get("speaker_name") or str(fallback_speaker or "")
+                            normalized_segments[0]["speaker_label"] = normalized_segments[0].get("speaker_label") or (
+                                "Speaker 1" if fallback_speaker else "Unknown Speaker"
+                            )
+                            normalized_segments[0]["rendered_speaker"] = _render_speaker_display(
+                                normalized_segments[0]["speaker_name"],
+                                normalized_segments[0]["speaker_label"],
+                            )
+                        rendered = _render_transcript_segments(normalized_segments)
+                    if rendered:
+                        artifacts["rendered_text"] = rendered
+                        artifacts["normalized_segments"] = normalized_segments or _transcript_segments_from_text(rendered)
+                        artifacts["source_mode"] = (
+                            "download_url+json_endpoint" if artifacts.get("raw_csv_bytes") else "json_endpoint"
+                        )
+                        return artifacts
+            except httpx.HTTPStatusError as exc:
+                if exc.response is not None and exc.response.status_code in {400, 401, 403, 404}:
+                    _log_optional_dialpad_lookup("transcript_json", call_id, response=exc.response, error=exc)
+                else:
+                    LOG.warning("dialpad transcript_json lookup failed for call_id=%s: %s", call_id, exc)
+            except Exception as exc:
+                LOG.info("dialpad transcript_json lookup skipped for call_id=%s: %s", call_id, exc)
+
+    direct = _provider_transcript_text(payload, call_detail)
+    if direct:
+        artifacts["rendered_text"] = direct
+        artifacts["normalized_segments"] = _transcript_segments_from_text(direct)
+        artifacts["source_mode"] = artifacts.get("source_mode") or "embedded_payload"
+    return artifacts
 
 
 def _provider_summary_text(payload: Dict[str, Any], call_detail: Optional[Dict[str, Any]] = None) -> Optional[str]:
@@ -1231,12 +1696,20 @@ async def _fetch_call_detail(call_id: str) -> Dict[str, Any]:
         for path in (f"{DIALPAD_API_BASE}/call/{call_id}", f"{DIALPAD_API_BASE}/calls/{call_id}"):
             try:
                 response = await _dialpad_request("GET", path, client=client)
+                if response.status_code in {401, 403, 404}:
+                    _log_optional_dialpad_lookup("call_detail", call_id, response=response)
+                    continue
                 response.raise_for_status()
                 body = response.json()
                 if isinstance(body, dict):
                     return body
-            except Exception:
-                continue
+            except httpx.HTTPStatusError as exc:
+                if exc.response is not None and exc.response.status_code in {401, 403, 404}:
+                    _log_optional_dialpad_lookup("call_detail", call_id, response=exc.response, error=exc)
+                    continue
+                LOG.warning("dialpad call_detail lookup failed for call_id=%s: %s", call_id, exc)
+            except Exception as exc:
+                LOG.info("dialpad call_detail lookup skipped for call_id=%s: %s", call_id, exc)
     return {}
 
 
@@ -1453,6 +1926,8 @@ async def _resolve_recording_url(candidate: Dict[str, Any]) -> Optional[str]:
 
 async def _resolve_payload_recordings(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     channel = _archive_channel(payload)
+    if channel == "sms":
+        return []
     candidates = list(_recording_candidates(payload))
     call_id = _call_id_for_payload(payload)
 
@@ -1770,8 +2245,10 @@ async def handle_archive_export(job: Dict[str, Any]) -> Dict[str, Any]:
     async with _archive_lock_for(payload):
         event_uuid = str(job.get("event_uuid") or payload.get("event_uuid") or "")
         channel = _archive_channel(payload)
+        overwrite_archive = bool(payload.get("overwrite_archive"))
         occurred_at = _parse_occurred_at(payload.get("occurred_at"))
-        source_provenance = payload.get("source_provenance") or {}
+        source_provenance = _normalized_sms_provenance(payload.get("source_provenance") or {})
+        payload["source_provenance"] = source_provenance
         company_slug = _company_slug(source_provenance)
         phone_bucket = _safe_component(_conversation_number(source_provenance), "unknown_number")
         external_id = str(payload.get("external_id") or "")
@@ -1786,6 +2263,12 @@ async def handle_archive_export(job: Dict[str, Any]) -> Dict[str, Any]:
             )
         )
 
+        if overwrite_archive:
+            for matching_dir in _find_matching_archive_dirs(event_uuid, external_id):
+                if matching_dir.exists():
+                    shutil.rmtree(matching_dir)
+            existing_archive_dir = None
+
         archive_dir = existing_archive_dir or (phone_channel_root / event_stem)
         archive_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1797,8 +2280,10 @@ async def handle_archive_export(job: Dict[str, Any]) -> Dict[str, Any]:
             "event_stem": event_stem,
             "company_slug": company_slug,
         }
-        existing_manifest = _load_manifest_entries(archive_dir, event_stem)
-        if not existing_manifest:
+        existing_manifest: List[Dict[str, Any]] = []
+        if not overwrite_archive:
+            existing_manifest = _load_manifest_entries(archive_dir, event_stem)
+        if not existing_manifest and not overwrite_archive:
             existing_manifest = _rebuild_manifest_entries(archive_dir, event_stem, common_meta)
 
         metadata_payload = {
@@ -1847,7 +2332,7 @@ async def handle_archive_export(job: Dict[str, Any]) -> Dict[str, Any]:
 
         call_detail: Dict[str, Any] = {}
         call_id = _call_id_for_payload(payload)
-        if call_id and (DIALPAD_ACCESS_TOKEN or DIALPAD_REFRESH_TOKEN):
+        if _channel_supports_dialpad_enrichment(payload) and call_id and (DIALPAD_ACCESS_TOKEN or DIALPAD_REFRESH_TOKEN):
             call_detail = await _fetch_call_detail(call_id)
         if call_detail:
             call_detail_path = archive_dir / f"{event_stem}_call_detail.json"
@@ -1865,7 +2350,35 @@ async def handle_archive_export(job: Dict[str, Any]) -> Dict[str, Any]:
                 )
             )
 
-        provider_transcript_text = _provider_transcript_text(payload, call_detail)
+        provider_transcript_artifacts = await _provider_transcript_artifacts_enriched(payload, call_detail)
+        provider_transcript_text = provider_transcript_artifacts.get("rendered_text")
+        provider_transcript_segments = provider_transcript_artifacts.get("normalized_segments") or []
+        provider_transcript_csv_bytes = provider_transcript_artifacts.get("raw_csv_bytes")
+        provider_transcript_csv_content_type = (
+            provider_transcript_artifacts.get("raw_csv_content_type") or "text/csv"
+        )
+        provider_transcript_source_mode = provider_transcript_artifacts.get("source_mode")
+        transcript_csv_path = archive_dir / f"{event_stem}_provider_transcript.csv"
+        if isinstance(provider_transcript_csv_bytes, (bytes, bytearray)) and provider_transcript_csv_bytes:
+            transcript_csv_size = _write_bytes(transcript_csv_path, bytes(provider_transcript_csv_bytes))
+            manifest.append(
+                _manifest_entry(
+                    transcript_csv_path,
+                    str(provider_transcript_csv_content_type or "text/csv"),
+                    {
+                        **common_meta,
+                        "file_role": "provider_transcript_csv",
+                        "provider": "dialpad",
+                        "source_mode": provider_transcript_source_mode,
+                    },
+                    transcript_csv_size,
+                )
+            )
+        elif transcript_csv_path.exists():
+            try:
+                transcript_csv_path.unlink()
+            except OSError:
+                pass
         if isinstance(provider_transcript_text, str) and provider_transcript_text.strip():
             transcript_path = archive_dir / f"{event_stem}_provider_transcript.txt"
             transcript_size = _write_text(transcript_path, provider_transcript_text)
@@ -1877,25 +2390,36 @@ async def handle_archive_export(job: Dict[str, Any]) -> Dict[str, Any]:
                         **common_meta,
                         "file_role": "provider_transcript",
                         "provider": "dialpad",
+                        "source_mode": provider_transcript_source_mode,
                     },
                     transcript_size,
                 )
             )
-            transcript_csv_path = archive_dir / f"{event_stem}_provider_transcript.csv"
-            transcript_csv_size = _write_transcript_csv(transcript_csv_path, provider_transcript_text)
+            transcript_json_path = archive_dir / f"{event_stem}_provider_transcript.json"
+            transcript_json_size = _write_json(
+                transcript_json_path,
+                _provider_transcript_json_payload(
+                    payload,
+                    event_uuid=event_uuid,
+                    source_mode=provider_transcript_source_mode,
+                    rendered_text=provider_transcript_text,
+                    segments=provider_transcript_segments,
+                    fallback_speaker=_inferred_transcript_speaker(payload),
+                ),
+            )
             manifest.append(
                 _manifest_entry(
-                    transcript_csv_path,
-                    "text/csv",
+                    transcript_json_path,
+                    "application/json",
                     {
                         **common_meta,
-                        "file_role": "provider_transcript_csv",
+                        "file_role": "provider_transcript_json",
                         "provider": "dialpad",
+                        "source_mode": provider_transcript_source_mode,
                     },
-                    transcript_csv_size,
+                    transcript_json_size,
                 )
             )
-
         provider_summary_text = _provider_summary_text(payload, call_detail)
         if isinstance(provider_summary_text, str) and provider_summary_text.strip():
             summary_path = archive_dir / f"{event_stem}_provider_summary.txt"
@@ -1931,6 +2455,18 @@ async def handle_archive_export(job: Dict[str, Any]) -> Dict[str, Any]:
                 )
             )
 
+        metadata_payload["provider_transcript_source_mode"] = provider_transcript_source_mode
+        metadata_payload["provider_transcript_preserved"] = bool(provider_transcript_text)
+        metadata_payload["provider_transcript_csv_preserved"] = bool(provider_transcript_csv_bytes)
+        metadata_payload["provider_transcript_json_preserved"] = bool(provider_transcript_text)
+        metadata_payload["provider_summary_text"] = provider_summary_text
+        metadata_payload["provider_action_items"] = provider_action_items
+        metadata_size = _write_json(metadata_path, metadata_payload)
+        for entry in manifest:
+            if entry.get("storage_uri") == str(metadata_path):
+                entry["byte_size"] = metadata_size
+                break
+
         sms_text = payload.get("sms_text")
         rendered_sms_text = _render_sms_text(payload, sms_text) if isinstance(sms_text, str) else None
         if rendered_sms_text:
@@ -1965,13 +2501,16 @@ async def handle_archive_export(job: Dict[str, Any]) -> Dict[str, Any]:
                 )
             )
 
-        audio_manifests, audio_results = await _download_recordings(
-            payload,
-            archive_dir,
-            event_stem,
-            common_meta,
-            existing_manifest,
-        )
+        audio_manifests: List[Dict[str, Any]] = []
+        audio_results: List[Dict[str, Any]] = []
+        if channel != "sms":
+            audio_manifests, audio_results = await _download_recordings(
+                payload,
+                archive_dir,
+                event_stem,
+                common_meta,
+                existing_manifest,
+            )
         manifest.extend(audio_manifests)
 
         merged_manifest = _merge_manifest_entries(existing_manifest, manifest)
@@ -2000,6 +2539,8 @@ async def handle_archive_export(job: Dict[str, Any]) -> Dict[str, Any]:
             "archive_dir": str(archive_dir),
             "archive_files": final_manifest,
             "provider_transcript_preserved": bool(provider_transcript_text),
+            "provider_transcript_csv_preserved": bool(provider_transcript_csv_bytes),
+            "provider_transcript_json_preserved": bool(provider_transcript_text),
             "provider_summary_preserved": bool(provider_summary_text),
             "provider_action_item_count": len(provider_action_items),
             "sms_text_preserved": bool(rendered_sms_text),

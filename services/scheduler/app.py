@@ -1,6 +1,7 @@
 """TALOS Scheduler — baseline fallback + dispatch + live-to-deferred."""
 from __future__ import annotations
 import asyncio, json, logging, os, time
+from datetime import datetime, timezone
 from typing import Optional, Tuple
 import asyncpg, httpx
 from fastapi import FastAPI
@@ -12,9 +13,10 @@ LOCAL_WORKER_URL = os.environ.get("LOCAL_WORKER_URL","http://techton:8081")
 LOCAL_WORKER_TOKEN = os.environ.get("LOCAL_WORKER_TOKEN","")
 WORKER_PING_INTERVAL_SEC = int(os.environ.get("WORKER_PING_INTERVAL_SEC","30"))
 DISPATCH_BATCH_SIZE = int(os.environ.get("DISPATCH_BATCH_SIZE","10"))
+DIALPAD_RECOVERY_JOB_TYPE = "DIALPAD_MISSED_EVENT_RECOVERY"
 app = FastAPI(title="talos-scheduler", version="0.1.0")
 _pool: Optional[asyncpg.Pool] = None
-_worker = {"online":False,"last_seen":None,"last_error":None}
+_worker = {"online":False,"last_seen":None,"last_error":None,"offline_since":None}
 
 _OUTBOX_DDL = """
 CREATE TABLE IF NOT EXISTS bridge_outbox (
@@ -29,10 +31,28 @@ CREATE INDEX IF NOT EXISTS idx_bridge_outbox_undelivered
     ON bridge_outbox (created_at) WHERE delivered_at IS NULL;
 """
 
+_RECOVERY_DDL = """
+CREATE TABLE IF NOT EXISTS dialpad_recovery_state (
+    recovery_key             TEXT PRIMARY KEY,
+    last_recovered_through   TIMESTAMPTZ,
+    last_run_started_at      TIMESTAMPTZ,
+    last_run_finished_at     TIMESTAMPTZ,
+    last_run_status          TEXT NOT NULL DEFAULT 'idle',
+    last_error               TEXT,
+    last_job_uuid            UUID REFERENCES processing_jobs(job_uuid) ON DELETE SET NULL,
+    last_payload             JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at               TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
 @app.on_event("startup")
 async def _s():
     global _pool
     _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    async with _pool.acquire() as conn:
+        await _ensure_outbox(conn)
+        await conn.execute(_RECOVERY_DDL)
     asyncio.create_task(_ping_loop())
     asyncio.create_task(_dispatch_loop())
 
@@ -59,12 +79,21 @@ async def _ping_loop():
         _worker["online"] = online; _worker["last_error"] = err
         if online: _worker["last_seen"] = time.time()
         if was and not online:
+            _worker["offline_since"] = time.time()
             await _emit("WORKER_OFFLINE", {"local_worker_url":LOCAL_WORKER_URL,"error":err})
         if (not was) and online:
             replayed = await _requeue_deferred_jobs()
+            recovery_job = await _queue_dialpad_recovery()
+            previous_offline_since = _worker.get("offline_since")
+            _worker["offline_since"] = None
             await _emit("WORKER_ONLINE", {
                 "local_worker_url": LOCAL_WORKER_URL,
                 "requeued_deferred_jobs": replayed,
+                "dialpad_recovery_job_uuid": recovery_job,
+                "observed_offline_since": (
+                    datetime.fromtimestamp(previous_offline_since, tz=timezone.utc).isoformat()
+                    if previous_offline_since else None
+                ),
             })
         await asyncio.sleep(WORKER_PING_INTERVAL_SEC)
 
@@ -91,6 +120,59 @@ async def _requeue_deferred_jobs() -> int:
         if rows:
             LOG.info("requeued %s deferred jobs after worker came online", len(rows))
         return len(rows)
+
+
+async def _queue_dialpad_recovery() -> Optional[str]:
+    if _pool is None:
+        return None
+    observed_offline_since = _worker.get("offline_since")
+    observed_online_at = datetime.now(timezone.utc)
+    offline_iso = (
+        datetime.fromtimestamp(observed_offline_since, tz=timezone.utc).replace(microsecond=0).isoformat()
+        if observed_offline_since else None
+    )
+    idempotency_key = f"dialpad_recovery:{offline_iso or observed_online_at.replace(microsecond=0).isoformat()}"
+    payload = {
+        "observed_offline_since": offline_iso,
+        "observed_online_at": observed_online_at.replace(microsecond=0).isoformat(),
+        "local_worker_url": LOCAL_WORKER_URL,
+        "source": "scheduler_worker_online",
+    }
+    async with _pool.acquire() as conn:
+        await conn.execute(_RECOVERY_DDL)
+        active = await conn.fetchrow(
+            """
+            SELECT job_uuid
+            FROM processing_jobs
+            WHERE job_type=$1 AND state IN ('QUEUED','DISPATCHED','PROCESSING')
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            DIALPAD_RECOVERY_JOB_TYPE,
+        )
+        if active is not None:
+            return str(active["job_uuid"])
+        row = await conn.fetchrow(
+            """
+            INSERT INTO processing_jobs (job_type, state, priority, payload, idempotency_key)
+            VALUES ($1, 'QUEUED', 250, $2::jsonb, $3)
+            ON CONFLICT (idempotency_key) DO UPDATE
+            SET payload = EXCLUDED.payload
+            RETURNING job_uuid
+            """,
+            DIALPAD_RECOVERY_JOB_TYPE,
+            json.dumps(payload),
+            idempotency_key,
+        )
+        if row is None:
+            return None
+        await _emit_conn(conn, "DIALPAD_RECOVERY_QUEUED", {
+            "job_uuid": str(row["job_uuid"]),
+            "observed_offline_since": offline_iso,
+            "observed_online_at": payload["observed_online_at"],
+        })
+        LOG.info("queued Dialpad missed-event recovery job %s", row["job_uuid"])
+        return str(row["job_uuid"])
 
 async def decide_baseline_for_event(contact_uuid: Optional[str]) -> dict:
     if contact_uuid is None:

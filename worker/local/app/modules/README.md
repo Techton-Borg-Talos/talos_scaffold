@@ -22,6 +22,7 @@ Exceptions become `{"status":"error", "module":..., "error":...}`.
 - CONTACT_HISTORY_BACKFILL  → baseline_updates
 - BASELINE_REFRESH          → baseline_updates
 - DEFERRED_DRAIN            → deferred_backfill
+- DIALPAD_MISSED_EVENT_RECOVERY → dialpad_recovery
 - (none yet)                → popup_live_assist
 
 ## Must not

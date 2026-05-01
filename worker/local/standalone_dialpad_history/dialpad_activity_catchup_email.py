@@ -156,10 +156,31 @@ def _read_text(path: Path) -> Optional[str]:
     return text or None
 
 
+def _transcript_inline_text_from_json(payload: Dict[str, Any]) -> Optional[str]:
+    rendered_text = str(payload.get("rendered_text") or "").strip()
+    if rendered_text:
+        return rendered_text
+    segments = payload.get("segments")
+    if not isinstance(segments, list):
+        return None
+    lines: List[str] = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        text = str(segment.get("text") or "").strip()
+        if not text:
+            continue
+        rendered_speaker = str(segment.get("rendered_speaker") or "").strip()
+        lines.append(f"{rendered_speaker}: {text}" if rendered_speaker else text)
+    rendered = "\n".join(lines).strip()
+    return rendered or None
+
+
 def _event_paths(archive_dir: Path, event_stem: str) -> Dict[str, Any]:
     metadata_path = archive_dir / f"{event_stem}_metadata.json"
     event_path = archive_dir / f"{event_stem}_event.json"
     manifest_path = archive_dir / f"{event_stem}_manifest.json"
+    transcript_json_path = archive_dir / f"{event_stem}_provider_transcript.json"
     transcript_path = archive_dir / f"{event_stem}_provider_transcript.txt"
     summary_path = archive_dir / f"{event_stem}_provider_summary.txt"
     action_items_path = archive_dir / f"{event_stem}_provider_action_items.txt"
@@ -172,6 +193,7 @@ def _event_paths(archive_dir: Path, event_stem: str) -> Dict[str, Any]:
         "metadata": metadata_path if metadata_path.exists() else None,
         "event": event_path if event_path.exists() else None,
         "manifest": manifest_path if manifest_path.exists() else None,
+        "transcript_json": transcript_json_path if transcript_json_path.exists() else None,
         "transcript": transcript_path if transcript_path.exists() else None,
         "summary": summary_path if summary_path.exists() else None,
         "action_items": action_items_path if action_items_path.exists() else None,
@@ -296,6 +318,13 @@ def _event_direction(source_provenance: Dict[str, Any]) -> str:
 
 
 def _event_inline_text(paths: Dict[str, Any]) -> Optional[str]:
+    transcript_json_path = paths.get("transcript_json")
+    if isinstance(transcript_json_path, Path):
+        transcript_payload = _load_json(transcript_json_path)
+        if isinstance(transcript_payload, dict):
+            text = _transcript_inline_text_from_json(transcript_payload)
+            if text:
+                return text
     for key in ("transcript", "sms_text"):
         path = paths.get(key)
         if isinstance(path, Path):
@@ -392,8 +421,11 @@ def _event_record(
     source_metadata = event_payload if isinstance(event_payload, dict) else {}
     call_detail = _load_json(paths["call_detail"]) if isinstance(paths["call_detail"], Path) else {}
     call_detail_payload = call_detail if isinstance(call_detail, dict) else {}
+    transcript_payload = _load_json(paths["transcript_json"]) if isinstance(paths["transcript_json"], Path) else {}
+    transcript_json_payload = transcript_payload if isinstance(transcript_payload, dict) else {}
     inline_text = (
         _event_inline_text(paths)
+        or _transcript_inline_text_from_json(transcript_json_payload)
         or _event_inline_text_from_metadata(source_metadata)
         or _event_inline_text_from_metadata(call_detail_payload)
     )
@@ -418,6 +450,7 @@ def _event_record(
         "metadata": metadata,
         "source_metadata": source_metadata,
         "call_detail": call_detail_payload,
+        "transcript_payload": transcript_json_payload,
         "source_provenance": source_provenance,
         "contact_display": _resolve_contact_display(source_provenance, source_metadata, contacts_index),
         "direction": _event_direction(source_provenance),
@@ -459,7 +492,7 @@ def _format_paths(paths: Dict[str, Any]) -> List[str]:
     archive_dir = paths.get("archive_dir")
     if isinstance(archive_dir, Path):
         lines.append(f"Archive folder: {archive_dir}")
-    for label in ("metadata", "event", "manifest", "transcript", "sms_text", "recording_references"):
+    for label in ("metadata", "event", "manifest", "transcript_json", "transcript", "sms_text", "recording_references"):
         path = paths.get(label)
         if isinstance(path, Path):
             lines.append(f"{label.replace('_', ' ').title()}: {path}")

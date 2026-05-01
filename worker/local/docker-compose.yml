@@ -52,7 +52,7 @@ services:
       ARCHIVE_SYNC_SSH_KEY_PATH: ${ARCHIVE_SYNC_SSH_KEY_PATH:-}
       ARCHIVE_SYNC_SSH_OPTS: ${ARCHIVE_SYNC_SSH_OPTS:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      ENABLED_MODULES: ${ENABLED_MODULES:-transcription,archive_export,behavior_analysis,contact_engine_local,baseline_updates,deferred_backfill}
+      ENABLED_MODULES: ${ENABLED_MODULES:-transcription,archive_export,behavior_analysis,contact_engine_local,baseline_updates,deferred_backfill,dialpad_recovery}
     volumes:
       - worker_work:/var/lib/talos/work
       - worker_cache:/root/.cache
